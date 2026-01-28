@@ -1,0 +1,92 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+@variant dark (&:where(.dark, .dark *));
+
+:root {
+  --background: #ffffff;
+  --foreground: #171717;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --font-serif: var(--font-serif);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0a0a0a;
+    --foreground: #ededed;
+  }
+}
+
+:root.dark {
+  --background: #0a0a0a;
+  --foreground: #ededed;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans), Arial, Helvetica, sans-serif;
+}
+
+html, body {
+  height: 100%;
+  overscroll-behavior: none;
+}
+
+.ai-diff-insert {
+  background: rgba(16, 185, 129, 0.18);
+  border: none;
+  border-radius: 0;
+  padding: 0;
+}
+
+.dark .ai-diff-insert {
+  background: rgba(16, 185, 129, 0.22);
+}
+
+.ai-diff-delete-widget {
+  display: block;
+  margin: 6px 0;
+  padding: 6px 10px;
+  border-radius: 0;
+  border: none;
+  background: rgba(239, 68, 68, 0.12);
+  color: rgba(185, 28, 28, 0.95);
+  text-decoration: line-through;
+  white-space: pre-wrap;
+}
+
+.ProseMirror .ai-diff-insert {
+  box-shadow: inset 0 0 0 9999px rgba(16, 185, 129, 0.12);
+}
+
+.dark .ProseMirror .ai-diff-insert {
+  box-shadow: inset 0 0 0 9999px rgba(16, 185, 129, 0.16);
+}
+
+.dark .ai-diff-delete-widget {
+  background: rgba(239, 68, 68, 0.18);
+  color: rgba(254, 202, 202, 0.95);
+}
+
+.ProseMirror p.ai-diff-insert,
+.ProseMirror li.ai-diff-insert,
+.ProseMirror blockquote.ai-diff-insert,
+.ProseMirror pre.ai-diff-insert,
+.ProseMirror h1.ai-diff-insert,
+.ProseMirror h2.ai-diff-insert,
+.ProseMirror h3.ai-diff-insert,
+.ProseMirror h4.ai-diff-insert,
+.ProseMirror h5.ai-diff-insert,
+.ProseMirror h6.ai-diff-insert {
+  margin-top: 0 !important;
+  margin-bottom: 0 !important;
+  padding: 6px 12px;
+  border-radius: 0 !important;
+}

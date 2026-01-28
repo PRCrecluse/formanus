@@ -1,0 +1,1241 @@
+import { ChatOpenAI } from "@langchain/openai";
+import { createClient } from "@supabase/supabase-js";
+import JSZip from "jszip";
+import mammoth from "mammoth";
+import pdfParse from "pdf-parse";
+import * as XLSX from "xlsx";
+import { runWebSearch } from "@/lib/skills";
+import { fillPromptTemplate, loadPromptTemplate } from "@/lib/prompts";
+
+type SkillStatus = "ready" | "needs_config";
+
+export type SkillMeta = {
+  id: string;
+  name: string;
+  description: string;
+  category: "web" | "integration" | "documents";
+  status: SkillStatus;
+};
+
+type SkillRunOk = { ok: true; output: unknown };
+type SkillRunErr = { ok: false; error: string };
+export type SkillRunResult = SkillRunOk | SkillRunErr;
+
+type SkillContext = {
+  userId: string;
+  accessToken: string;
+};
+
+type Skill = {
+  id: string;
+  name: string;
+  description: string;
+  category: SkillMeta["category"];
+  getStatus: () => SkillStatus;
+  run: (args: { input: unknown; context: SkillContext; modelId?: string | null }) => Promise<SkillRunResult>;
+};
+
+const MODEL_CONFIGS = [
+  { id: "persona-ai", modelId: "google/gemini-3-pro-preview", keyName: "NEXT_PUBLIC_OPENROUTER_API_KEY" },
+  { id: "gpt-5.2", modelId: "openai/gpt-5.2", keyName: "NEXT_PUBLIC_GPT52_API_KEY" },
+  { id: "nanobanana", modelId: "google/gemini-3-pro-image-preview", keyName: "NEXT_PUBLIC_OPENROUTER_API_KEY" },
+  { id: "gemini-3.0-pro", modelId: "google/gemini-3-pro-preview", keyName: "NEXT_PUBLIC_OPENROUTER_API_KEY" },
+  { id: "minimax-m2", modelId: "minimax/minimax-m2", keyName: "NEXT_PUBLIC_MINIMAX_API_KEY" },
+  { id: "kimi-0905", modelId: "moonshotai/kimi-k2-0905", keyName: "NEXT_PUBLIC_KIMI_API_KEY" },
+  { id: "claude-3.5-sonnet", modelId: "anthropic/claude-3.5-sonnet", keyName: "NEXT_PUBLIC_CLAUDE_API_KEY" },
+] as const;
+
+function pickModelConfig(modelId: string | null | undefined) {
+  if (!modelId) return MODEL_CONFIGS[0];
+  const found = MODEL_CONFIGS.find((m) => m.id === modelId);
+  return found ?? MODEL_CONFIGS[0];
+}
+
+function createChatModel(modelKey: string | null | undefined) {
+  const cfg = pickModelConfig(modelKey);
+  const apiKey = (process.env[cfg.keyName] ?? "").toString();
+  if (!apiKey) {
+    throw new Error(`Missing API key for model ${cfg.id}`);
+  }
+  const base = (process.env.NEXT_PUBLIC_OPENROUTER_BASE_URL ?? "").toString().trim();
+  const baseURL = base || "https://openrouter.ai/api/v1";
+  return new ChatOpenAI({
+    model: cfg.modelId,
+    temperature: 0.2,
+    configuration: {
+      apiKey,
+      baseURL,
+    },
+  });
+}
+
+function creditsPerRequestForModelKey(modelKey: string | null | undefined): number {
+  if (modelKey === "gpt-oss") return 0;
+  if (modelKey === "claude-3.5-sonnet") return 3;
+  if (modelKey === "nanobanana") return 2;
+  if (modelKey === "gpt-5.2") return 2;
+  return 2;
+}
+
+function estimateTokens(text: string): number {
+  const raw = (text ?? "").toString();
+  if (!raw) return 0;
+  const cjk = (raw.match(/[\u4e00-\u9fff]/g) ?? []).length;
+  const nonCjkLen = raw.replace(/[\u4e00-\u9fff]/g, "").length;
+  return Math.max(1, Math.ceil(cjk + nonCjkLen / 4));
+}
+
+let billingClient: ReturnType<typeof createClient> | null = null;
+
+function getBillingClient() {
+  if (billingClient) return billingClient;
+  const supabaseUrl = (process.env.NEXT_PUBLIC_SUPABASE_URL ?? "").toString().trim();
+  const serviceKey = (process.env.SUPABASE_SERVICE_ROLE_KEY ?? "").toString().trim();
+  if (!supabaseUrl || !serviceKey) return null;
+  billingClient = createClient(supabaseUrl, serviceKey, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+    },
+  });
+  return billingClient;
+}
+
+async function chargeCredits(args: {
+  userId: string;
+  modelKey: string | null | undefined;
+  taskId: string;
+  title: string;
+  inputText: string;
+  outputText: string;
+}): Promise<{ billed: boolean; creditsUsed: number; newTotal: number | null }> {
+  const supabase = getBillingClient();
+  if (!supabase) {
+    return { billed: false, creditsUsed: 0, newTotal: null };
+  }
+  const creditsUsed = creditsPerRequestForModelKey(args.modelKey);
+  if (!Number.isFinite(creditsUsed) || creditsUsed <= 0) return { billed: false, creditsUsed: 0, newTotal: null };
+
+  const currentCreditsRes = await supabase.from("users").select("credits").eq("id", args.userId).maybeSingle();
+  if (currentCreditsRes.error) {
+    return { billed: false, creditsUsed: 0, newTotal: null };
+  }
+  const currentCreditsRaw = (currentCreditsRes.data as { credits?: unknown } | null)?.credits;
+  const currentCredits = typeof currentCreditsRaw === "number" && Number.isFinite(currentCreditsRaw) ? Math.floor(currentCreditsRaw) : 0;
+  const newCredits = currentCredits - creditsUsed;
+
+  const insertRes = await (supabase.from("credit_history") as unknown as {
+    insert: (values: { id: string; user_id: string; title: string; qty: number; amount?: number; total: number }) => PromiseLike<{
+      error: { code?: string; message?: string } | null;
+    }>;
+  }).insert({
+    id: args.taskId,
+    user_id: args.userId,
+    title: args.title,
+    qty: -creditsUsed,
+    amount: -creditsUsed,
+    total: newCredits,
+  });
+  if (insertRes.error) {
+    if (insertRes.error.code === "23505") {
+      return { billed: false, creditsUsed: 0, newTotal: null };
+    }
+    return { billed: false, creditsUsed: 0, newTotal: null };
+  }
+  const updateRes = await (supabase.from("users") as unknown as {
+    update: (values: { credits: number }) => {
+      eq: (column: string, value: string) => PromiseLike<{ error: { message?: string } | null }>;
+    };
+  })
+    .update({ credits: newCredits })
+    .eq("id", args.userId);
+  if (updateRes.error) {
+    return { billed: true, creditsUsed, newTotal: null };
+  }
+  return { billed: true, creditsUsed, newTotal: newCredits };
+}
+
+function normalizeJsonText(text: string): string {
+  const raw = (text ?? "").toString();
+  const noFence = raw.replace(/```(?:json)?/gi, "").replace(/```/g, "");
+  const normalizedQuotes = noFence.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+  return normalizedQuotes.replace(/,\s*([}\]])/g, "$1").trim();
+}
+
+function tryParseJson(text: string): unknown | null {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function extractFirstJsonObject(text: string): unknown | null {
+  const cleaned = normalizeJsonText(text);
+  if (cleaned.startsWith("{") || cleaned.startsWith("[")) {
+    const direct = tryParseJson(cleaned);
+    if (direct) return direct;
+  }
+  const start = cleaned.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let esc = false;
+  for (let i = start; i < cleaned.length; i++) {
+    const ch = cleaned[i]!;
+    if (inString) {
+      if (esc) {
+        esc = false;
+        continue;
+      }
+      if (ch === "\\") {
+        esc = true;
+        continue;
+      }
+      if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === "{") depth++;
+    if (ch === "}") depth--;
+    if (depth === 0) {
+      const slice = cleaned.slice(start, i + 1);
+      return tryParseJson(slice);
+    }
+  }
+  return null;
+}
+
+type XhsBatchPlan = {
+  title: string;
+  cover: { title: string; subtitle?: string; image_prompt: string };
+  pages: Array<{ title: string; bullets: string[]; caption: string; image_prompt: string }>;
+  hashtags: string[];
+};
+
+function normalizeXhsPlan(value: unknown): XhsBatchPlan | null {
+  if (!value || typeof value !== "object") return null;
+  const o = value as Record<string, unknown>;
+  const title = typeof o.title === "string" ? o.title.trim() : "";
+  const coverRaw = (o.cover ?? null) as Record<string, unknown> | null;
+  const coverTitle = typeof coverRaw?.title === "string" ? coverRaw.title.trim() : "";
+  const coverSubtitle = typeof coverRaw?.subtitle === "string" ? coverRaw.subtitle.trim() : "";
+  const coverPrompt = typeof coverRaw?.image_prompt === "string" ? coverRaw.image_prompt.trim() : "";
+  const pagesRaw = Array.isArray(o.pages) ? o.pages : [];
+  const pages = pagesRaw
+    .map((p) => {
+      const po = (p ?? {}) as Record<string, unknown>;
+      const pt = typeof po.title === "string" ? po.title.trim() : "";
+      const bulletsRaw = Array.isArray(po.bullets) ? po.bullets : [];
+      const bullets = bulletsRaw
+        .map((b) => (typeof b === "string" ? b.trim() : ""))
+        .filter(Boolean)
+        .slice(0, 8);
+      const caption = typeof po.caption === "string" ? po.caption.trim() : "";
+      const imgPrompt = typeof po.image_prompt === "string" ? po.image_prompt.trim() : "";
+      if (!pt || bullets.length === 0 || !caption || !imgPrompt) return null;
+      return { title: pt, bullets, caption, image_prompt: imgPrompt };
+    })
+    .filter((p): p is XhsBatchPlan["pages"][number] => Boolean(p));
+  const tagsRaw = Array.isArray(o.hashtags) ? o.hashtags : [];
+  const hashtags = tagsRaw
+    .map((t) => (typeof t === "string" ? t.trim() : ""))
+    .filter(Boolean)
+    .map((t) => (t.startsWith("#") ? t : `#${t}`))
+    .slice(0, 20);
+  if (!title || !coverTitle || !coverPrompt || pages.length === 0) return null;
+  return { title, cover: { title: coverTitle, subtitle: coverSubtitle || undefined, image_prompt: coverPrompt }, pages, hashtags };
+}
+
+function clampInt(value: unknown, min: number, max: number, fallback: number): number {
+  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  if (!Number.isFinite(n)) return fallback;
+  const i = Math.floor(n);
+  return Math.min(Math.max(i, min), max);
+}
+
+function parseClampedInt(value: unknown, min: number, max: number): number | null {
+  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  if (!Number.isFinite(n)) return null;
+  const i = Math.floor(n);
+  return Math.min(Math.max(i, min), max);
+}
+
+function parseChineseCountToken(token: string): number | null {
+  const t = token.trim();
+  if (!t) return null;
+  if (/^\d{1,2}$/.test(t)) {
+    const n = Number(t);
+    if (!Number.isFinite(n)) return null;
+    if (n < 1 || n > 15) return null;
+    return n;
+  }
+  const map: Record<string, number> = {
+    一: 1,
+    二: 2,
+    两: 2,
+    三: 3,
+    四: 4,
+    五: 5,
+    六: 6,
+    七: 7,
+    八: 8,
+    九: 9,
+  };
+  if (t === "十") return 10;
+  if (t === "十一") return 11;
+  if (t === "十二") return 12;
+  if (t === "十三") return 13;
+  if (t === "十四") return 14;
+  if (t === "十五") return 15;
+  if (t.length === 2 && t.startsWith("十")) {
+    const tail = map[t.slice(1)];
+    if (!tail) return null;
+    const n = 10 + tail;
+    return n >= 1 && n <= 15 ? n : null;
+  }
+  const direct = map[t];
+  return direct && direct >= 1 && direct <= 15 ? direct : null;
+}
+
+function parseXhsRequestedCount(text: string): number | null {
+  const raw = (text ?? "").toString();
+  if (!raw.trim()) return null;
+  const digitMatch = raw.match(/(?:^|[^\d])(\d{1,2})\s*(?:个|篇|条|组|套)?\s*(?:小红书|xhs|xiaohongshu)?\s*(?:图文|笔记|帖子|post|posts)?/i);
+  if (digitMatch?.[1]) {
+    const n = parseChineseCountToken(digitMatch[1]);
+    if (n) return n;
+  }
+  const cnMatch = raw.match(/(十五|十四|十三|十二|十一|十|九|八|七|六|五|四|三|二|两|一)\s*(?:个|篇|条|组|套)?\s*(?:小红书|图文|笔记|帖子)?/);
+  if (cnMatch?.[1]) {
+    const n = parseChineseCountToken(cnMatch[1]);
+    if (n) return n;
+  }
+  return null;
+}
+
+function isChineseText(text: string) {
+  return /[\u4e00-\u9fff]/.test(text);
+}
+
+function getPngDimensions(bytes: Buffer): { w: number; h: number } | null {
+  if (bytes.length < 24) return null;
+  if (
+    bytes[0] !== 0x89 ||
+    bytes[1] !== 0x50 ||
+    bytes[2] !== 0x4e ||
+    bytes[3] !== 0x47 ||
+    bytes[4] !== 0x0d ||
+    bytes[5] !== 0x0a ||
+    bytes[6] !== 0x1a ||
+    bytes[7] !== 0x0a
+  )
+    return null;
+  const w = bytes.readUInt32BE(16);
+  const h = bytes.readUInt32BE(20);
+  if (!w || !h) return null;
+  return { w, h };
+}
+
+function getJpegDimensions(bytes: Buffer): { w: number; h: number } | null {
+  if (bytes.length < 4) return null;
+  if (bytes[0] !== 0xff || bytes[1] !== 0xd8) return null;
+  let offset = 2;
+  while (offset + 4 < bytes.length) {
+    if (bytes[offset] !== 0xff) return null;
+    const marker = bytes[offset + 1]!;
+    const len = bytes.readUInt16BE(offset + 2);
+    if (len < 2) return null;
+    const isSof =
+      (marker >= 0xc0 && marker <= 0xc3) ||
+      (marker >= 0xc5 && marker <= 0xc7) ||
+      (marker >= 0xc9 && marker <= 0xcb) ||
+      (marker >= 0xcd && marker <= 0xcf);
+    if (isSof) {
+      if (offset + 2 + len > bytes.length) return null;
+      const h = bytes.readUInt16BE(offset + 5);
+      const w = bytes.readUInt16BE(offset + 7);
+      if (!w || !h) return null;
+      return { w, h };
+    }
+    offset += 2 + len;
+  }
+  return null;
+}
+
+function getWebpDimensions(bytes: Buffer): { w: number; h: number } | null {
+  if (bytes.length < 30) return null;
+  if (bytes.toString("ascii", 0, 4) !== "RIFF") return null;
+  if (bytes.toString("ascii", 8, 12) !== "WEBP") return null;
+  const chunk = bytes.toString("ascii", 12, 16);
+  if (chunk !== "VP8X") return null;
+  const w = 1 + bytes.readUIntLE(24, 3);
+  const h = 1 + bytes.readUIntLE(27, 3);
+  if (!w || !h) return null;
+  return { w, h };
+}
+
+function getImageDimensions(bytes: Buffer, ext: string): { w: number; h: number } | null {
+  const e = (ext ?? "").toLowerCase();
+  if (e === "png") return getPngDimensions(bytes);
+  if (e === "jpg" || e === "jpeg") return getJpegDimensions(bytes);
+  if (e === "webp") return getWebpDimensions(bytes);
+  return null;
+}
+
+function isThreeFourRatio(w: number, h: number) {
+  if (!w || !h) return false;
+  return w * 4 === h * 3;
+}
+
+function buildXhsImagePrompt(args: {
+  template: string;
+  pageType: string;
+  pageContent: string;
+  extraPrompt: string;
+  requiredHeadline: string;
+  userTopic?: string;
+  fullOutline?: string;
+  language: "zh" | "en";
+}) {
+  const base = args.template
+    ? fillPromptTemplate(args.template, {
+        page_type: args.pageType,
+        page_content: args.pageContent,
+        user_topic: args.userTopic ?? "",
+        full_outline: args.fullOutline ?? "",
+      })
+    : "";
+  const langLabel = args.language === "zh" ? "Simplified Chinese" : "English";
+  const required = (args.requiredHeadline ?? "").trim();
+  const extra = (args.extraPrompt ?? "").trim();
+  const parts = [
+    base,
+    extra,
+    "Constraints: portrait 3:4, clean composition, crisp typography, high contrast, no blur, no watermark, no platform logo, no frame.",
+    required ? `Text overlay: include EXACT ${langLabel} headline text: "${required}".` : "",
+    `All text in the image must be ${langLabel}. Do not use any other language.`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return parts.trim();
+}
+
+async function fetchPollinationsImage(prompt: string, size: { w: number; h: number }, seed: number): Promise<{ bytes: Buffer; ext: string }> {
+  const apiKey = (process.env.NEXT_PUBLIC_OPENROUTER_API_KEY ?? process.env.OPENROUTER_API_KEY ?? "").toString().trim();
+  const base = (process.env.NEXT_PUBLIC_OPENROUTER_BASE_URL ?? "").toString().trim() || "https://openrouter.ai/api/v1";
+  if (apiKey) {
+    const aspectRatio = size.w === size.h ? "1:1" : size.h > size.w ? "3:4" : "4:3";
+    const body = {
+      model: "google/gemini-3-pro-image-preview",
+      messages: [{ role: "user", content: prompt }],
+      modalities: ["image", "text"],
+      image_config: { aspect_ratio: aspectRatio },
+    };
+    const res = await fetch(`${base.replace(/\/+$/g, "")}/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      throw new Error(`Image generation failed (${res.status})`);
+    }
+    const data = (await res.json()) as {
+      choices?: Array<{ message?: { images?: Array<{ image_url?: { url?: string | null } | null }> | null } | null }>;
+    };
+    const url =
+      data.choices?.[0]?.message?.images?.[0]?.image_url?.url &&
+      data.choices[0]!.message!.images![0]!.image_url!.url!.toString();
+    if (!url) {
+      throw new Error("No image returned from model");
+    }
+    if (url.startsWith("data:")) {
+      const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(url);
+      if (!match) throw new Error("Invalid data URL");
+      const mime = match[1]!.toLowerCase();
+      const b64 = match[2]!;
+      const bytes = Buffer.from(b64, "base64");
+      const ext = mime.includes("png") ? "png" : mime.includes("webp") ? "webp" : mime.includes("jpeg") || mime.includes("jpg") ? "jpg" : "png";
+      return { bytes, ext };
+    }
+    const ctrl = new AbortController();
+    const timeout = setTimeout(() => ctrl.abort(), 25_000);
+    try {
+      const direct = await fetch(url, { method: "GET", redirect: "follow", signal: ctrl.signal });
+      if (!direct.ok) throw new Error(`Image fetch failed (${direct.status})`);
+      const ct = (direct.headers.get("content-type") ?? "").toLowerCase();
+      const bytes = Buffer.from(await direct.arrayBuffer());
+      const ext = ct.includes("png") ? "png" : ct.includes("webp") ? "webp" : "jpg";
+      return { bytes, ext };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  const fallbackUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=${size.w}&height=${size.h}&seed=${seed}`;
+  const ctrl = new AbortController();
+  const timeout = setTimeout(() => ctrl.abort(), 25_000);
+  try {
+    const res = await fetch(fallbackUrl, { method: "GET", redirect: "follow", signal: ctrl.signal });
+    if (!res.ok) throw new Error(`Image fetch failed (${res.status})`);
+    const ct = (res.headers.get("content-type") ?? "").toLowerCase();
+    const bytes = Buffer.from(await res.arrayBuffer());
+    const ext = ct.includes("png") ? "png" : ct.includes("webp") ? "webp" : "jpg";
+    return { bytes, ext };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function uploadToSupabaseStorage(args: {
+  accessToken: string;
+  bucket: string;
+  key: string;
+  contentType: string;
+  bytes: Buffer;
+}): Promise<string> {
+  const supabaseUrl = (process.env.NEXT_PUBLIC_SUPABASE_URL ?? "").toString().trim();
+  const supabaseAnonKey = (process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "").toString().trim();
+  if (!supabaseUrl || !supabaseAnonKey) throw new Error("Supabase not configured");
+
+  const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+    global: {
+      headers: {
+        Authorization: `Bearer ${args.accessToken}`,
+      },
+    },
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+    },
+  });
+
+  const up = await supabase.storage.from(args.bucket).upload(args.key, args.bytes, {
+    contentType: args.contentType,
+    upsert: false,
+  });
+  if (up.error) throw new Error(up.error.message);
+  const pub = supabase.storage.from(args.bucket).getPublicUrl(args.key);
+  const url = (pub.data?.publicUrl ?? "").toString().trim();
+  if (!url) throw new Error("Failed to get public url");
+  return url;
+}
+
+function decodeBase64ToBuffer(value: string): Buffer {
+  const clean = value.trim();
+  if (!clean) return Buffer.from("");
+  const idx = clean.indexOf("base64,");
+  const b64 = idx >= 0 ? clean.slice(idx + "base64,".length) : clean;
+  return Buffer.from(b64, "base64");
+}
+
+function extractUrls(text: string): string[] {
+  const raw = text.toString();
+  const matches = raw.match(/https?:\/\/[^\s)<>"']+/g) ?? [];
+  const normalized = matches
+    .map((u) => u.replace(/[),.]+$/g, ""))
+    .map((u) => u.trim())
+    .filter(Boolean);
+  return Array.from(new Set(normalized)).slice(0, 8);
+}
+
+function stripHtml(html: string): string {
+  const base = html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return base;
+}
+
+async function fetchUrlText(url: string): Promise<{ url: string; status: number; title: string | null; text: string }> {
+  const ctrl = new AbortController();
+  const timeout = setTimeout(() => ctrl.abort(), 9000);
+  try {
+    const res = await fetch(url, {
+      redirect: "follow",
+      signal: ctrl.signal,
+      headers: {
+        "User-Agent": "AIPersonaBot/1.0",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+      },
+    });
+    const status = res.status;
+    const contentType = (res.headers.get("content-type") ?? "").toLowerCase();
+    const raw = await res.text();
+    const titleMatch = raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    const title = titleMatch ? stripHtml(titleMatch[1]) : null;
+    const text = contentType.includes("html") ? stripHtml(raw) : raw.replace(/\s+/g, " ").trim();
+    return { url, status, title, text: text.slice(0, 20_000) };
+  } catch {
+    return { url, status: 0, title: null, text: "" };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function extractPptxText(buffer: Buffer): Promise<string> {
+  const zip = await JSZip.loadAsync(buffer);
+  const slideNames = Object.keys(zip.files)
+    .filter((n) => n.startsWith("ppt/slides/slide") && n.endsWith(".xml"))
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const parts: string[] = [];
+  for (const name of slideNames) {
+    const xml = await zip.file(name)!.async("string");
+    const matches = xml.match(/<a:t[^>]*>([\s\S]*?)<\/a:t>/g) ?? [];
+    const text = matches
+      .map((m) => m.replace(/<a:t[^>]*>/, "").replace(/<\/a:t>/, ""))
+      .join(" ");
+    const cleaned = stripHtml(text)
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'");
+    if (cleaned) parts.push(cleaned);
+  }
+  return parts.join("\n");
+}
+
+async function notionRequest(token: string, path: string, init?: RequestInit) {
+  const url = `https://api.notion.com/v1${path}`;
+  return fetch(url, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Notion-Version": "2022-06-28",
+      "Content-Type": "application/json",
+      ...(init?.headers ?? {}),
+    },
+  });
+}
+
+function notionPlainTextFromRich(value: unknown): string {
+  if (!Array.isArray(value)) return "";
+  return value
+    .map((v) => {
+      const t = (v as { plain_text?: unknown })?.plain_text;
+      return typeof t === "string" ? t : "";
+    })
+    .filter(Boolean)
+    .join("");
+}
+
+async function fetchNotionPageText(token: string, pageId: string): Promise<string> {
+  const out: string[] = [];
+  let cursor: string | null = null;
+  for (let i = 0; i < 50; i++) {
+    const qs = new URLSearchParams();
+    qs.set("page_size", "100");
+    if (cursor) qs.set("start_cursor", cursor);
+    const res = await notionRequest(token, `/blocks/${encodeURIComponent(pageId)}/children?${qs.toString()}`, { method: "GET" });
+    if (!res.ok) break;
+    const data = (await res.json()) as {
+      results?: unknown[];
+      has_more?: boolean;
+      next_cursor?: string | null;
+    };
+    const blocks = Array.isArray(data.results) ? data.results : [];
+    for (const b of blocks) {
+      const type = (b as { type?: unknown })?.type;
+      if (typeof type !== "string") continue;
+      const content = (b as Record<string, unknown>)[type] as { rich_text?: unknown } | undefined;
+      const line = notionPlainTextFromRich(content?.rich_text);
+      if (line) out.push(line);
+    }
+    if (!data.has_more) break;
+    cursor = typeof data.next_cursor === "string" ? data.next_cursor : null;
+    if (!cursor) break;
+  }
+  return out.join("\n").slice(0, 40_000);
+}
+
+const SKILLS: Skill[] = [
+  {
+    id: "design-image",
+    name: "Design Image",
+    description: "Image design mode, placeholder skill for model binding and routing.",
+    category: "documents",
+    getStatus: () => {
+      const hasAnyKey = MODEL_CONFIGS.some((m) => Boolean((process.env[m.keyName] ?? "").toString().trim()));
+      return hasAnyKey ? "ready" : "needs_config";
+    },
+    run: async ({ input }) => {
+      const payload = (input ?? {}) as Record<string, unknown>;
+      return { ok: true, output: { ok: true, input: payload } };
+    },
+  },
+  {
+    id: "xhs-batch",
+    name: "XHS Batch",
+    description: "Batch-generate Xiaohongshu posts (outline → cover → pages → export).",
+    category: "documents",
+    getStatus: () => {
+      const hasAnyKey = MODEL_CONFIGS.some((m) => Boolean((process.env[m.keyName] ?? "").toString().trim()));
+      return hasAnyKey ? "ready" : "needs_config";
+    },
+    run: async ({ input, context, modelId }) => {
+      const obj = (input ?? {}) as {
+        topic?: unknown;
+        pages?: unknown;
+        style?: unknown;
+      };
+      const topic = typeof obj.topic === "string" ? obj.topic.trim() : "";
+      if (!topic) return { ok: false, error: "topic is required" };
+      const pages = parseClampedInt(obj.pages, 1, 15) ?? parseXhsRequestedCount(topic) ?? 3;
+      const style = typeof obj.style === "string" ? obj.style.trim() : "";
+      const useChinese = isChineseText(topic) || isChineseText(style);
+      const captionLanguage = useChinese ? "中文" : "英文";
+      const imageTextLanguage = useChinese ? "zh" : "en";
+
+      let model: ChatOpenAI;
+      try {
+        model = createChatModel(modelId);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Failed to create model";
+        return { ok: false, error: msg };
+      }
+
+      const sysTemplate = await loadPromptTemplate("xhs_batch_system.txt");
+      const sys = sysTemplate
+        ? fillPromptTemplate(sysTemplate, {
+            pages: String(pages),
+            caption_language: captionLanguage,
+            text_language: useChinese ? "简体中文" : "英文",
+          })
+        : [
+            "你是小红书图文策划与文案编辑。",
+            "目标：根据用户的一句话主题，生成一个可直接用于小红书的图文脚本（封面+多页内容）。",
+            "必须输出 JSON，不能输出多余文本。",
+          ].join("\n");
+
+      const user = [
+        `主题：${topic}`,
+        style ? `风格/人设：${style}` : "",
+        "请严格按 JSON 输出。",
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      let plan: XhsBatchPlan | null = null;
+      try {
+        const res = await model.invoke([
+          { role: "system", content: sys },
+          { role: "user", content: user },
+        ]);
+        const text =
+          typeof res === "string"
+            ? res
+            : typeof res === "object" && res !== null && "content" in res
+              ? String((res as { content?: unknown }).content ?? "")
+              : "";
+        try {
+          const taskId = crypto.randomUUID();
+          await chargeCredits({
+            userId: context.userId,
+            modelKey: modelId,
+            taskId,
+            title: `Skill usage · xhs-batch · ${modelId || "default"}`,
+            inputText: `${sys}\n\n${user}`,
+            outputText: text,
+          });
+        } catch {
+          void 0;
+        }
+        const parsed = extractFirstJsonObject(text);
+        plan = normalizeXhsPlan(parsed);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Model call failed";
+        return { ok: false, error: msg };
+      }
+
+      if (!plan) return { ok: false, error: "Failed to parse model output" };
+      if (plan.pages.length !== pages) return { ok: false, error: `Model output pages mismatch (expected ${pages})` };
+
+      const zip = new JSZip();
+      const seedBase = Math.floor(Math.random() * 100_000);
+      const size = { w: 1080, h: 1440 };
+      const outline = [
+        `封面：${plan.cover.title}${plan.cover.subtitle ? `｜${plan.cover.subtitle}` : ""}`,
+        ...plan.pages.map((p, idx) => {
+          const bullets = p.bullets.map((b) => `- ${b}`).join("\n");
+          const caption = p.caption ? `\n${p.caption}` : "";
+          return [`第${idx + 1}页：${p.title}`, bullets, caption].filter(Boolean).join("\n");
+        }),
+      ]
+        .filter(Boolean)
+        .join("\n\n")
+        .slice(0, 20_000);
+      const promptTemplate =
+        (await loadPromptTemplate("image_prompt.txt")) ||
+        (await loadPromptTemplate("image_prompt_short.txt")) ||
+        "";
+      const generateImage = async (prompt: string, seed: number): Promise<{ bytes: Buffer; ext: string }> => {
+        let last: { bytes: Buffer; ext: string } | null = null;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const nextPrompt =
+            attempt === 0
+              ? prompt
+              : `${prompt}\n\nHard constraints: portrait 3:4 exactly, text must be crisp and legible, no blur.`;
+          const img = await fetchPollinationsImage(nextPrompt, size, seed);
+          last = img;
+          const dims = getImageDimensions(img.bytes, img.ext);
+          if (!dims) return img;
+          if (isThreeFourRatio(dims.w, dims.h)) return img;
+        }
+        return last ?? (await fetchPollinationsImage(prompt, size, seed));
+      };
+
+      const sessionId = crypto.randomUUID();
+
+      let coverUrl: string | null = null;
+      try {
+        const coverContent = [plan.cover.title, plan.cover.subtitle].filter(Boolean).join("\n").slice(0, 600);
+        const coverPrompt = buildXhsImagePrompt({
+          template: promptTemplate,
+          pageType: "封面",
+          pageContent: coverContent,
+          extraPrompt: plan.cover.image_prompt,
+          requiredHeadline: plan.cover.title,
+          userTopic: topic,
+          fullOutline: outline,
+          language: imageTextLanguage,
+        });
+        const coverImage = await generateImage(coverPrompt, seedBase);
+        zip.file(`images/cover.${coverImage.ext}`, coverImage.bytes);
+        const coverKey = `${context.userId}/xhs/${sessionId}/cover.${coverImage.ext}`;
+        coverUrl = await uploadToSupabaseStorage({
+          accessToken: context.accessToken,
+          bucket: "chat-attachments",
+          key: coverKey,
+          contentType: coverImage.ext === "png" ? "image/png" : coverImage.ext === "webp" ? "image/webp" : "image/jpeg",
+          bytes: coverImage.bytes,
+        });
+      } catch {
+        coverUrl = null;
+      }
+
+      const pageImageUrls: Array<string | null> = [];
+      for (let i = 0; i < plan.pages.length; i++) {
+        const p = plan.pages[i]!;
+        try {
+          const pageContent = [`标题：${p.title}`, ...p.bullets.map((b) => `- ${b}`), p.caption].filter(Boolean).join("\n").slice(0, 1200);
+          const pagePrompt = buildXhsImagePrompt({
+            template: promptTemplate,
+            pageType: `第${i + 1}页`,
+            pageContent,
+            extraPrompt: p.image_prompt,
+            requiredHeadline: p.title,
+            userTopic: topic,
+            fullOutline: outline,
+            language: imageTextLanguage,
+          });
+          const img = await generateImage(pagePrompt, seedBase + i + 1);
+          zip.file(`images/page-${String(i + 1).padStart(2, "0")}.${img.ext}`, img.bytes);
+          const pageKey = `${context.userId}/xhs/${sessionId}/page-${String(i + 1).padStart(2, "0")}.${img.ext}`;
+          const url = await uploadToSupabaseStorage({
+            accessToken: context.accessToken,
+            bucket: "chat-attachments",
+            key: pageKey,
+            contentType: img.ext === "png" ? "image/png" : img.ext === "webp" ? "image/webp" : "image/jpeg",
+            bytes: img.bytes,
+          });
+          pageImageUrls.push(url);
+        } catch {
+          pageImageUrls.push(null);
+        }
+      }
+
+      const mdParts: string[] = [];
+      mdParts.push(`# ${plan.title}`);
+      mdParts.push("");
+      mdParts.push("## 封面");
+      mdParts.push(`- 标题：${plan.cover.title}`);
+      if (plan.cover.subtitle) mdParts.push(`- 副标题：${plan.cover.subtitle}`);
+      mdParts.push("");
+      for (let i = 0; i < plan.pages.length; i++) {
+        const p = plan.pages[i]!;
+        mdParts.push(`## 第${i + 1}页：${p.title}`);
+        for (const b of p.bullets) mdParts.push(`- ${b}`);
+        mdParts.push("");
+        mdParts.push(p.caption);
+        mdParts.push("");
+      }
+      if (plan.hashtags.length > 0) {
+        mdParts.push("## 标签");
+        mdParts.push(plan.hashtags.join(" "));
+        mdParts.push("");
+      }
+      zip.file("script.md", mdParts.join("\n"));
+
+      const zipBytes = Buffer.from(await zip.generateAsync({ type: "uint8array" }));
+      const zipKey = `${context.userId}/xhs/${sessionId}/xhs-assets.zip`;
+      let zipUrl: string;
+      try {
+        zipUrl = await uploadToSupabaseStorage({
+          accessToken: context.accessToken,
+          bucket: "chat-attachments",
+          key: zipKey,
+          contentType: "application/zip",
+          bytes: zipBytes,
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Upload failed";
+        return { ok: false, error: msg };
+      }
+
+      const supabaseUrl = (process.env.NEXT_PUBLIC_SUPABASE_URL ?? "").toString().trim();
+      const supabaseAnonKey = (process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "").toString().trim();
+      if (!supabaseUrl || !supabaseAnonKey) {
+        return { ok: false, error: "Supabase not configured" };
+      }
+      const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+        global: {
+          headers: {
+            Authorization: `Bearer ${context.accessToken}`,
+          },
+        },
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false,
+          detectSessionInUrl: false,
+        },
+      });
+
+      const nowIso = new Date().toISOString();
+      const folderId = `private-${context.userId}-${sessionId}-folder`;
+      const docsPayload: Array<{
+        id: string;
+        persona_id: string | null;
+        title: string;
+        content: string;
+        type: string;
+        updated_at: string;
+      }> = [];
+
+      docsPayload.push({
+        id: folderId,
+        persona_id: null,
+        title: plan.title,
+        content: "",
+        type: "persona;folder=1;parent=",
+        updated_at: nowIso,
+      });
+
+      for (let i = 0; i < plan.pages.length; i++) {
+        const p = plan.pages[i]!;
+        const postId = `private-${context.userId}-${sessionId}-post-${String(i + 1).padStart(2, "0")}`;
+        const media: Array<{ id: string; kind: "image" | "video"; url: string; duration_sec?: number | null }> = [];
+        const imgUrl = pageImageUrls[i] ?? null;
+        if (imgUrl) {
+          media.push({ id: crypto.randomUUID(), kind: "image", url: imgUrl, duration_sec: null });
+        }
+        const postDraft = {
+          text: p.caption,
+          platform: "小红书",
+          account: null,
+          media,
+          postType: media.length > 0 ? "图文" : "纯文字",
+        };
+        docsPayload.push({
+          id: postId,
+          persona_id: null,
+          title: p.title || `第${i + 1}页`,
+          content: JSON.stringify(postDraft),
+          type: `posts;folder=0;parent=${folderId}`,
+          updated_at: nowIso,
+        });
+      }
+
+      try {
+        const { error } = await supabase.from("persona_docs").upsert(docsPayload);
+        if (error) {
+          throw new Error(error.message);
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Failed to persist XHS docs";
+        return { ok: false, error: msg };
+      }
+
+      const createdDocs = docsPayload.map((d) => ({
+        id: d.id,
+        title: d.title,
+        updated_at: d.updated_at,
+        persona_id: d.persona_id,
+        type: d.type,
+        content: d.content,
+      }));
+
+      return {
+        ok: true,
+        output: {
+          title: plan.title,
+          cover: { title: plan.cover.title, subtitle: plan.cover.subtitle ?? null, url: coverUrl },
+          pages: plan.pages.map((p, idx) => ({
+            index: idx + 1,
+            title: p.title,
+            bullets: p.bullets,
+            caption: p.caption,
+            image_url: pageImageUrls[idx] ?? null,
+          })),
+          hashtags: plan.hashtags,
+          zip_url: zipUrl,
+          folder_id: folderId,
+          docs: createdDocs,
+        },
+      };
+    },
+  },
+  {
+    id: "web-verify",
+    name: "Web Verify",
+    description: "Fetch URLs and verify claims using cited sources.",
+    category: "web",
+    getStatus: () => {
+      const hasAnyKey = MODEL_CONFIGS.some((m) => Boolean((process.env[m.keyName] ?? "").toString().trim()));
+      return hasAnyKey ? "ready" : "needs_config";
+    },
+    run: async ({ input, modelId, context }) => {
+      const obj = (input ?? {}) as { urls?: unknown; question?: unknown; claim?: unknown };
+      const urls = Array.isArray(obj.urls) ? obj.urls.filter((u) => typeof u === "string").map((u) => u.trim()).filter(Boolean) : [];
+      const question = typeof obj.question === "string" ? obj.question.trim() : "";
+      const claim = typeof obj.claim === "string" ? obj.claim.trim() : "";
+      const pickedUrls = Array.from(new Set(urls)).slice(0, 8);
+      if (pickedUrls.length === 0) return { ok: false, error: "urls is required" };
+      let model: ChatOpenAI;
+      try {
+        model = createChatModel(modelId);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Failed to create model";
+        return { ok: false, error: msg };
+      }
+
+      const pages = await Promise.all(pickedUrls.map((u) => fetchUrlText(u)));
+      const sources = pages.map((p) => ({
+        url: p.url,
+        status: p.status,
+        title: p.title,
+        excerpt: p.text.slice(0, 3000),
+      }));
+      const prompt = [
+        "你是一个严谨的事实查证助手。",
+        "你必须基于提供的网页来源内容进行判断，不能凭空编造。",
+        "输出格式：",
+        "1) 结论（支持/不确定/反驳）",
+        "2) 依据（要点）",
+        "3) 引用（列出用到的 URL）",
+        "",
+        claim ? `待查证观点：${claim}` : "",
+        question ? `问题：${question}` : "",
+        "来源内容（JSON，已截断）：",
+        JSON.stringify(sources),
+      ]
+        .filter(Boolean)
+        .join("\n");
+      try {
+        const res = await model.invoke(prompt);
+        const text =
+          typeof res === "string"
+            ? res
+            : typeof res === "object" && res !== null && "content" in res
+              ? String((res as { content?: unknown }).content ?? "")
+              : "";
+        try {
+          const taskId = crypto.randomUUID();
+          await chargeCredits({
+            userId: context.userId,
+            modelKey: modelId,
+            taskId,
+            title: `Skill usage · web-verify · ${modelId || "default"}`,
+            inputText: prompt,
+            outputText: text,
+          });
+        } catch {
+          void 0;
+        }
+        return { ok: true, output: { answer: text.trim(), sources } };
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Model call failed";
+        return { ok: false, error: msg };
+      }
+    },
+  },
+  {
+    id: "search-query",
+    name: "Search Query",
+    description: "Search the web and return top results.",
+    category: "web",
+    getStatus: () => "ready",
+    run: async ({ input }) => {
+      const obj = (input ?? {}) as { query?: unknown; limit?: unknown };
+      const query = typeof obj.query === "string" ? obj.query.trim() : "";
+      if (!query) return { ok: false, error: "query is required" };
+      const limit = clampInt(obj.limit, 1, 10, 5);
+      try {
+        const results = await runWebSearch(query, limit);
+        return { ok: true, output: { query, limit, results } };
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Search failed";
+        return { ok: false, error: msg };
+      }
+    },
+  },
+  {
+    id: "notion-integration",
+    name: "Notion Integration",
+    description: "Read Notion page blocks and extract plain text.",
+    category: "integration",
+    getStatus: () => {
+      const token = (process.env.NOTION_TOKEN ?? "").toString().trim();
+      return token ? "ready" : "needs_config";
+    },
+    run: async ({ input }) => {
+      const obj = (input ?? {}) as { token?: unknown; pageId?: unknown };
+      const token = (typeof obj.token === "string" ? obj.token : process.env.NOTION_TOKEN ?? "").toString().trim();
+      const pageId = (typeof obj.pageId === "string" ? obj.pageId : "").toString().trim();
+      if (!token) return { ok: false, error: "Missing Notion token (NOTION_TOKEN)" };
+      if (!pageId) return { ok: false, error: "pageId is required" };
+      const text = await fetchNotionPageText(token, pageId);
+      return { ok: true, output: { pageId, text } };
+    },
+  },
+  {
+    id: "pdf",
+    name: "PDF",
+    description: "Extract plain text from a PDF.",
+    category: "documents",
+    getStatus: () => "ready",
+    run: async ({ input }) => {
+      const obj = (input ?? {}) as { base64?: unknown };
+      const base64 = typeof obj.base64 === "string" ? obj.base64 : "";
+      if (!base64) return { ok: false, error: "base64 is required" };
+      const buffer = decodeBase64ToBuffer(base64);
+      try {
+        const data = await pdfParse(buffer);
+        return { ok: true, output: { text: (data.text ?? "").toString(), pages: data.numpages ?? null } };
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Failed to parse PDF";
+        return { ok: false, error: msg };
+      }
+    },
+  },
+  {
+    id: "pdf-parser",
+    name: "PDF Parser",
+    description: "Parse a PDF and return text plus basic metadata (pages, etc.).",
+    category: "documents",
+    getStatus: () => "ready",
+    run: async ({ input }) => {
+      const obj = (input ?? {}) as { base64?: unknown };
+      const base64 = typeof obj.base64 === "string" ? obj.base64 : "";
+      if (!base64) return { ok: false, error: "base64 is required" };
+      const buffer = decodeBase64ToBuffer(base64);
+      try {
+        const data = await pdfParse(buffer);
+        return {
+          ok: true,
+          output: {
+            pages: data.numpages ?? null,
+            info: data.info ?? null,
+            metadata: data.metadata ?? null,
+            text: (data.text ?? "").toString(),
+          },
+        };
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Failed to parse PDF";
+        return { ok: false, error: msg };
+      }
+    },
+  },
+  {
+    id: "docx",
+    name: "DOCX",
+    description: "Extract plain text from a .docx (via mammoth).",
+    category: "documents",
+    getStatus: () => "ready",
+    run: async ({ input }) => {
+      const obj = (input ?? {}) as { base64?: unknown };
+      const base64 = typeof obj.base64 === "string" ? obj.base64 : "";
+      if (!base64) return { ok: false, error: "base64 is required" };
+      const buffer = decodeBase64ToBuffer(base64);
+      try {
+        const res = await mammoth.extractRawText({ buffer });
+        return { ok: true, output: { text: (res.value ?? "").toString() } };
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Failed to parse DOCX";
+        return { ok: false, error: msg };
+      }
+    },
+  },
+  {
+    id: "xlsx",
+    name: "XLSX",
+    description: "Extract tables from a .xlsx as text (sheet → TSV).",
+    category: "documents",
+    getStatus: () => "ready",
+    run: async ({ input }) => {
+      const obj = (input ?? {}) as { base64?: unknown };
+      const base64 = typeof obj.base64 === "string" ? obj.base64 : "";
+      if (!base64) return { ok: false, error: "base64 is required" };
+      const buffer = decodeBase64ToBuffer(base64);
+      try {
+        const wb = XLSX.read(buffer, { type: "buffer" });
+        const out: { name: string; tsv: string }[] = [];
+        for (const name of wb.SheetNames.slice(0, 10)) {
+          const sheet = wb.Sheets[name];
+          const tsv = XLSX.utils.sheet_to_csv(sheet, { FS: "\t" });
+          out.push({ name, tsv: tsv.slice(0, 50_000) });
+        }
+        return { ok: true, output: { sheets: out } };
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Failed to parse XLSX";
+        return { ok: false, error: msg };
+      }
+    },
+  },
+  {
+    id: "pptx",
+    name: "PPTX",
+    description: "Extract slide text from a .pptx (XML parsing).",
+    category: "documents",
+    getStatus: () => "ready",
+    run: async ({ input }) => {
+      const obj = (input ?? {}) as { base64?: unknown };
+      const base64 = typeof obj.base64 === "string" ? obj.base64 : "";
+      if (!base64) return { ok: false, error: "base64 is required" };
+      const buffer = decodeBase64ToBuffer(base64);
+      try {
+        const text = await extractPptxText(buffer);
+        return { ok: true, output: { text } };
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Failed to parse PPTX";
+        return { ok: false, error: msg };
+      }
+    },
+  },
+];
+
+export function listSkills(): SkillMeta[] {
+  return SKILLS.map((s) => ({
+    id: s.id,
+    name: s.name,
+    description: s.description,
+    category: s.category,
+    status: s.getStatus(),
+  }));
+}
+
+export async function runSkill(args: { id: string; input: unknown; context: SkillContext; modelId?: string | null }): Promise<SkillRunResult> {
+  const skill = SKILLS.find((s) => s.id === args.id) ?? null;
+  if (!skill) return { ok: false, error: "Unknown skill" };
+  return skill.run({ input: args.input, context: args.context, modelId: args.modelId });
+}
