@@ -10,6 +10,12 @@ type TodoItemPayload = {
   done: boolean;
 };
 
+type PreviewConfigDoc = {
+  enabled: boolean;
+  auto_confirm: boolean;
+  confirm_timeout_seconds: number;
+};
+
 function normalizeString(value: unknown): string {
   return String(value ?? "").trim();
 }
@@ -93,11 +99,15 @@ export async function POST(req: Request) {
   const webhookUrl = normalizeStringOrNull(payload.webhook_url);
   
   // 新增：预览配置
-  const previewConfig = payload.preview_config ? {
-    enabled: Boolean((payload.preview_config as any).enabled),
-    auto_confirm: Boolean((payload.preview_config as any).auto_confirm),
-    confirm_timeout_seconds: Number((payload.preview_config as any).confirm_timeout_seconds) || 10,
-  } : null;
+  let previewConfig: PreviewConfigDoc | null = null;
+  if (payload.preview_config && typeof payload.preview_config === "object") {
+    const cfg = payload.preview_config as Record<string, unknown>;
+    previewConfig = {
+      enabled: normalizeBoolean(cfg.enabled, false),
+      auto_confirm: normalizeBoolean(cfg.auto_confirm, false),
+      confirm_timeout_seconds: Number(cfg.confirm_timeout_seconds) || 10,
+    };
+  }
 
   const todos = normalizeTodos(payload.todos).map((t) => ({
     _id: normalizeString(t.id) || crypto.randomUUID(),
@@ -107,7 +117,9 @@ export async function POST(req: Request) {
   }));
 
   const db = await getMongoDb();
-  await db.collection<AutomationDoc & { previewConfig?: any }>("automations").insertOne({
+  await db
+    .collection<AutomationDoc & { previewConfig?: PreviewConfigDoc | null }>("automations")
+    .insertOne({
     _id: id,
     userId: auth.user.id,
     name,
@@ -122,10 +134,9 @@ export async function POST(req: Request) {
     lastError: null,
     createdAt: now,
     updatedAt: now,
-  });
+    });
 
   await syncAutomationScheduler().catch(() => null);
 
   return Response.json({ id });
 }
-
