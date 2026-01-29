@@ -1,6 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 import { getUserFromRequest } from "@/lib/supabaseAuthServer";
 import { ensureUserIndexUpToDate, getUserPersonaIds, pickRagEmbeddingsConfig, retrieveRelevantDocs } from "@/lib/rag";
+import { AIPERSONA_SYSTEM_PROMPT } from "@/lib/prompts"; // 导入调优后的提示词
 
 export const runtime = "nodejs";
 
@@ -314,7 +315,7 @@ let billingClient: ReturnType<typeof createClient> | null = null;
 
 function getBillingClient() {
   if (billingClient) return billingClient;
-  const supabaseUrl = (process.env.NEXT_PUBLIC_SUPABASE_URL ?? "").toString().trim();
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const serviceKey = (process.env.SUPABASE_SERVICE_ROLE_KEY ?? "").toString().trim();
   if (!supabaseUrl || !serviceKey) return null;
   billingClient = createClient(supabaseUrl, serviceKey, {
@@ -455,6 +456,13 @@ export async function POST(req: Request) {
   const ragEmbeddings = ragEnabled ? pickRagEmbeddingsConfig() : null;
 
   let augmented: ChatMessage[] = messages;
+  
+  // 注入调优后的系统提示词 (AIPersona Strategic Orchestrator)
+  const systemMsg: ChatMessage = {
+    role: "system",
+    content: AIPERSONA_SYSTEM_PROMPT,
+  };
+
   if (ragEnabled && ragEmbeddings) {
     try {
       const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
@@ -474,19 +482,26 @@ export async function POST(req: Request) {
             })
             .join("\n\n---\n\n")
             .slice(0, 24_000);
-          const sys: ChatMessage = {
+          
+          const ragSys: ChatMessage = {
             role: "system",
             content: ["Relevant user documents are provided below.", "Use them when answering if helpful.", "", text]
               .filter(Boolean)
               .join("\n"),
           };
-          const firstIsSystem = messages.length > 0 && messages[0]?.role === "system";
-          augmented = firstIsSystem ? [messages[0]!, sys, ...messages.slice(1)] : [sys, ...messages];
+          // 编排：调优提示词放在最前，RAG 信息紧随其后
+          augmented = [systemMsg, ragSys, ...messages];
+        } else {
+          augmented = [systemMsg, ...messages];
         }
+      } else {
+        augmented = [systemMsg, ...messages];
       }
     } catch {
-      augmented = messages;
+      augmented = [systemMsg, ...messages];
     }
+  } else {
+    augmented = [systemMsg, ...messages];
   }
 
   console.info("[chat/complete] task_started", { taskId, requestId, userId: auth.user.id, modelId: modelKey || null });
