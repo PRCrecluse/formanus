@@ -33,6 +33,13 @@ function normalizeOrigin(value: string) {
   return value.replace(/\/+$/, "");
 }
 
+function getPublicHostname(req: NextRequest) {
+  const forwardedHost = (req.headers.get("x-forwarded-host") ?? "").toString().trim();
+  const hostHeader = forwardedHost || (req.headers.get("host") ?? "").toString().trim();
+  const first = hostHeader.split(",")[0]?.trim() ?? "";
+  return first.split(":")[0]?.trim() ?? "";
+}
+
 function getPublicOrigin(req: NextRequest) {
   const forwardedProto = (req.headers.get("x-forwarded-proto") ?? "").toString().trim();
   const forwardedHost = (req.headers.get("x-forwarded-host") ?? "").toString().trim();
@@ -40,6 +47,16 @@ function getPublicOrigin(req: NextRequest) {
   const proto = forwardedProto || req.nextUrl.protocol.replace(":", "");
   const origin = host && proto ? `${proto}://${host}` : req.nextUrl.origin;
   return normalizeOrigin(origin);
+}
+
+function getCookieDomain(req: NextRequest) {
+  const envDomain = (process.env.COOKIE_DOMAIN ?? "").toString().trim();
+  if (envDomain) return envDomain;
+  const hostname = getPublicHostname(req);
+  if (!hostname) return undefined;
+  if (hostname === "localhost" || hostname.endsWith(".vercel.app")) return undefined;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(hostname)) return undefined;
+  return hostname.startsWith("www.") ? hostname.slice(4) : hostname;
 }
 
 export async function GET(req: NextRequest) {
@@ -104,10 +121,12 @@ export async function GET(req: NextRequest) {
     const res = NextResponse.json({ url, requestId }, { headers: { "x-request-id": requestId } });
 
     const secure = origin.startsWith("https://");
+    const domain = getCookieDomain(req);
     res.cookies.set("notion_oauth_state", state, {
       httpOnly: true,
       sameSite: "lax",
       secure,
+      domain,
       path: "/",
       maxAge: 600,
     });
@@ -115,6 +134,7 @@ export async function GET(req: NextRequest) {
       httpOnly: true,
       sameSite: "lax",
       secure,
+      domain,
       path: "/",
       maxAge: 600,
     });

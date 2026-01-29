@@ -25,6 +25,7 @@ type SkillRow = {
   description: string;
   visibility: "public" | "private";
   configured: boolean;
+  installed: boolean;
 };
 
 const MODEL_SETTINGS_KEY = "aipersona.chat.models.enabled";
@@ -76,6 +77,9 @@ export default function SettingsPage() {
   const [skills, setSkills] = useState<SkillRow[]>([]);
   const [skillsLoading, setSkillsLoading] = useState(false);
   const [skillsError, setSkillsError] = useState<string | null>(null);
+  const [skillsQuery, setSkillsQuery] = useState("");
+  const [skillsFilter, setSkillsFilter] = useState<"all" | "installed" | "uninstalled" | "configured" | "needs_setup">("all");
+  const [skillsMutatingId, setSkillsMutatingId] = useState<string | null>(null);
   const [setupSkill, setSetupSkill] = useState<SkillRow | null>(null);
   const [notionTokenDraft, setNotionTokenDraft] = useState("");
   const [notionTokenSaved, setNotionTokenSaved] = useState(false);
@@ -328,6 +332,54 @@ export default function SettingsPage() {
       void fetchSkills();
     }
   }, [activeTab, fetchSkills]);
+
+  const setSkillInstalled = useCallback(
+    async (id: string, installed: boolean) => {
+      if (!id) return;
+      setSkillsMutatingId(id);
+      setSkillsError(null);
+      try {
+        const token = accessToken;
+        if (!token) {
+          setSkillsError("未登录");
+          return;
+        }
+
+        const res = await fetch("/api/skills", {
+          method: "PATCH",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ id, installed }),
+        });
+
+        if (!res.ok) {
+          const text = await res.text().catch(() => "");
+          throw new Error(text || `HTTP ${res.status}`);
+        }
+
+        setSkills((prev) => prev.map((s) => (s.id === id ? { ...s, installed } : s)));
+
+        if (typeof window !== "undefined" && id === "notion-integration" && !installed) {
+          window.localStorage.removeItem("aipersona.notion.token");
+          setNotionTokenDraft("");
+          setNotionTokenSaved(false);
+        }
+
+        if (!installed && setupSkill?.id === id) {
+          setSetupSkill(null);
+          setSetupMessage(null);
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Unknown error";
+        setSkillsError(message);
+      } finally {
+        setSkillsMutatingId((cur) => (cur === id ? null : cur));
+      }
+    },
+    [accessToken, setupSkill]
+  );
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -948,15 +1000,40 @@ export default function SettingsPage() {
                       <h2 className="text-lg font-semibold">Skills</h2>
                       <p className="text-sm text-zinc-500 dark:text-zinc-400">View the server-side skills available in your workspace (Skill Store coming soon).</p>
                     </div>
-                    <div className="flex items-center gap-3">
-                      <button
-                        onClick={() => void fetchSkills()}
-                        className="rounded-md px-3 py-1.5 text-sm text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800"
-                        disabled={skillsLoading}
-                      >
-                        Refresh
-                      </button>
-                      {skillsLoading && <Loader2 className="h-4 w-4 animate-spin text-zinc-400" />}
+                    <div className="flex w-full max-w-xl flex-col items-stretch gap-3 sm:items-end">
+                      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-end">
+                        <input
+                          value={skillsQuery}
+                          onChange={(e) => setSkillsQuery(e.target.value)}
+                          placeholder="Search skills..."
+                          className="h-9 w-full rounded-md border border-zinc-200 bg-white px-3 text-sm text-zinc-900 placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-zinc-300 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100 dark:placeholder:text-zinc-600 dark:focus:ring-zinc-700 sm:w-64"
+                        />
+                        <select
+                          value={skillsFilter}
+                          onChange={(e) =>
+                            setSkillsFilter(
+                              (e.target.value as "all" | "installed" | "uninstalled" | "configured" | "needs_setup") ?? "all"
+                            )
+                          }
+                          className="h-9 w-full rounded-md border border-zinc-200 bg-white px-3 text-sm text-zinc-900 focus:outline-none focus:ring-2 focus:ring-zinc-300 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100 dark:focus:ring-zinc-700 sm:w-44"
+                        >
+                          <option value="all">All</option>
+                          <option value="installed">Installed</option>
+                          <option value="uninstalled">Not installed</option>
+                          <option value="configured">Configured</option>
+                          <option value="needs_setup">Needs setup</option>
+                        </select>
+                      </div>
+                      <div className="flex items-center justify-end gap-3">
+                        <button
+                          onClick={() => void fetchSkills()}
+                          className="rounded-md px-3 py-1.5 text-sm text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                          disabled={skillsLoading}
+                        >
+                          Refresh
+                        </button>
+                        {skillsLoading && <Loader2 className="h-4 w-4 animate-spin text-zinc-400" />}
+                      </div>
                     </div>
                   </div>
 
@@ -966,69 +1043,113 @@ export default function SettingsPage() {
                     </div>
                   )}
 
-                  <div className="space-y-3">
-                    {skills.length === 0 && !skillsLoading ? (
-                      <div className="text-sm text-zinc-500">No skills found</div>
-                    ) : (
-                      skills.map((s) => (
-                        (() => {
-                          const effectiveConfigured =
-                            s.id === "notion-integration" ? Boolean(s.configured || notionTokenSaved) : Boolean(s.configured);
-                          const canSetup = !effectiveConfigured && (s.id === "notion-integration" || s.id === "web-verify");
-                          return (
-                        <div
-                          key={s.id}
-                          className="flex flex-col gap-2 rounded-lg border border-zinc-100 bg-white p-4 shadow-sm shadow-zinc-200/70 dark:border-zinc-800 dark:bg-zinc-950 dark:shadow-md dark:shadow-black/30"
-                        >
-                          <div className="flex items-start justify-between gap-3">
-                            <div className="min-w-0">
-                              <div className="flex items-center gap-2">
-                                <div className="font-medium text-zinc-900 dark:text-zinc-100">{s.name}</div>
-                                <span className="rounded-md border border-zinc-200 bg-zinc-50 px-2 py-0.5 text-[11px] text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300">
-                                  {s.visibility}
-                                </span>
-                              </div>
-                              <div className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">{s.description}</div>
-                            </div>
-                            <span
-                              className={`shrink-0 rounded-full px-2.5 py-1 text-[11px] font-medium ${
-                                effectiveConfigured
-                                  ? "bg-green-50 text-green-700 dark:bg-green-900/20 dark:text-green-400"
-                                  : "bg-amber-50 text-amber-700 dark:bg-amber-900/20 dark:text-amber-300"
-                              }`}
-                            >
-                              {effectiveConfigured ? "Configured" : "Needs setup"}
-                            </span>
-                          </div>
-                          <div className="flex items-center justify-between gap-3">
-                            <div className="min-w-0 truncate text-xs text-zinc-500 dark:text-zinc-400">{s.id}</div>
-                            <div className="flex shrink-0 items-center gap-2">
-                              {canSetup && (
-                                <button
-                                  type="button"
-                                  onClick={() => openSetup(s)}
-                                  className="rounded-md border border-zinc-200 bg-white px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-300 dark:hover:bg-zinc-900"
+                  {(() => {
+                    const query = skillsQuery.trim().toLowerCase();
+                    const filteredSkills = skills
+                      .filter((s) => {
+                        if (query) {
+                          const hay = `${s.name} ${s.id} ${s.description}`.toLowerCase();
+                          if (!hay.includes(query)) return false;
+                        }
+                        const effectiveConfigured =
+                          s.id === "notion-integration" ? Boolean(s.configured || notionTokenSaved) : Boolean(s.configured);
+                        if (skillsFilter === "installed") return s.installed;
+                        if (skillsFilter === "uninstalled") return !s.installed;
+                        if (skillsFilter === "configured") return s.installed && effectiveConfigured;
+                        if (skillsFilter === "needs_setup") return s.installed && !effectiveConfigured;
+                        return true;
+                      })
+                      .sort((a, b) => {
+                        if (a.installed !== b.installed) return a.installed ? -1 : 1;
+                        return a.name.localeCompare(b.name);
+                      });
+
+                    return (
+                      <div className="space-y-3">
+                        {filteredSkills.length === 0 && !skillsLoading ? (
+                          <div className="text-sm text-zinc-500">No skills found</div>
+                        ) : (
+                          filteredSkills.map((s) => (
+                            (() => {
+                              const effectiveConfigured =
+                                s.id === "notion-integration" ? Boolean(s.configured || notionTokenSaved) : Boolean(s.configured);
+                              const canSetup = s.installed && !effectiveConfigured && (s.id === "notion-integration" || s.id === "web-verify");
+                              const mutating = skillsMutatingId === s.id;
+                              return (
+                                <div
+                                  key={s.id}
+                                  className="flex flex-col gap-2 rounded-lg border border-zinc-100 bg-white p-4 shadow-sm shadow-zinc-200/70 dark:border-zinc-800 dark:bg-zinc-950 dark:shadow-md dark:shadow-black/30"
                                 >
-                                  Setup
-                                </button>
-                              )}
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  void navigator.clipboard?.writeText(s.id);
-                                }}
-                                className="rounded-md px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800"
-                              >
-                                Copy id
-                              </button>
-                            </div>
-                          </div>
-                        </div>
-                          );
-                        })()
-                      ))
-                    )}
-                  </div>
+                                  <div className="flex items-start justify-between gap-3">
+                                    <div className="min-w-0">
+                                      <div className="font-medium text-zinc-900 dark:text-zinc-100">{s.name}</div>
+                                      <div className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">{s.description}</div>
+                                    </div>
+                                    <span
+                                      className={`shrink-0 rounded-full px-2.5 py-1 text-[11px] font-medium ${
+                                        !s.installed
+                                          ? "bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
+                                          : effectiveConfigured
+                                            ? "bg-green-50 text-green-700 dark:bg-green-900/20 dark:text-green-400"
+                                            : "bg-amber-50 text-amber-700 dark:bg-amber-900/20 dark:text-amber-300"
+                                      }`}
+                                    >
+                                      {!s.installed ? "Not installed" : effectiveConfigured ? "Configured" : "Needs setup"}
+                                    </span>
+                                  </div>
+                                  <div className="flex items-center justify-between gap-3">
+                                    <div className="min-w-0 truncate text-xs text-zinc-500 dark:text-zinc-400">{s.id}</div>
+                                    <div className="flex shrink-0 items-center gap-2">
+                                      {canSetup && (
+                                        <button
+                                          type="button"
+                                          onClick={() => openSetup(s)}
+                                          className="rounded-md border border-zinc-200 bg-white px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-300 dark:hover:bg-zinc-900"
+                                          disabled={mutating}
+                                        >
+                                          Setup
+                                        </button>
+                                      )}
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          if (mutating) return;
+                                          if (s.installed) {
+                                            const ok = window.confirm(`Uninstall "${s.name}"?`);
+                                            if (!ok) return;
+                                            void setSkillInstalled(s.id, false);
+                                          } else {
+                                            void setSkillInstalled(s.id, true);
+                                          }
+                                        }}
+                                        className={`rounded-md px-2 py-1 text-xs disabled:opacity-50 ${
+                                          s.installed
+                                            ? "text-red-700 hover:bg-red-50 dark:text-red-300 dark:hover:bg-red-900/20"
+                                            : "text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                                        }`}
+                                        disabled={mutating}
+                                      >
+                                        {mutating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : s.installed ? "Uninstall" : "Install"}
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          void navigator.clipboard?.writeText(s.id);
+                                        }}
+                                        className="rounded-md px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                                      >
+                                        Copy id
+                                      </button>
+                                    </div>
+                                  </div>
+                                </div>
+                              );
+                            })()
+                          ))
+                        )}
+                      </div>
+                    );
+                  })()}
                 </div>
               </div>
             )}

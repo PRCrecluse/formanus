@@ -126,6 +126,7 @@ type BoardChatMessage = {
   content: string;
   kind?: "normal" | "status";
   steps?: ChatToolStep[];
+  meta?: BoardAssistantMeta | null;
   attachedResourceIds?: string[];
   attachedPathRefs?: string[];
 };
@@ -141,6 +142,16 @@ type BoardAssistantDeliveryDoc = {
 type BoardAssistantMeta = {
   updated_docs?: BoardAssistantDeliveryDoc[];
   thinking_steps?: { label: string }[];
+  task_plan?: { title: string; status?: "pending" | "in_progress" | "completed" }[];
+  automation?: {
+    id: string;
+    name: string;
+    cron: string;
+    enabled: boolean;
+    auto_confirm?: boolean;
+    confirm_timeout_seconds?: number;
+    confirm_at?: string | null;
+  };
   model_id?: string;
   tokens_in?: number;
   tokens_out?: number;
@@ -169,9 +180,13 @@ function buildBoardAssistantDbContent(text: string, meta: BoardAssistantMeta | n
   const trimmed = (text ?? "").toString();
   const docs = Array.isArray(meta?.updated_docs) ? meta!.updated_docs! : [];
   const steps = Array.isArray(meta?.thinking_steps) ? meta!.thinking_steps! : [];
+  const taskPlan = Array.isArray(meta?.task_plan) ? meta!.task_plan! : [];
+  const automation = meta?.automation && typeof meta.automation === "object" ? meta.automation : null;
   const payload: BoardAssistantMeta = {};
   if (docs.length > 0) payload.updated_docs = docs;
   if (steps.length > 0) payload.thinking_steps = steps;
+  if (taskPlan.length > 0) payload.task_plan = taskPlan;
+  if (automation && automation.id) payload.automation = automation;
   if (typeof meta?.model_id === "string" && meta!.model_id) payload.model_id = meta!.model_id;
   if (typeof meta?.tokens_in === "number") payload.tokens_in = meta!.tokens_in;
   if (typeof meta?.tokens_out === "number") payload.tokens_out = meta!.tokens_out;
@@ -223,9 +238,53 @@ function parseBoardMessageContent(raw: string): { text: string; meta: BoardAssis
         })
         .filter((x): x is { label: string } => Boolean(x))
     : [];
+  const taskPlanRaw = (parsed as { task_plan?: unknown }).task_plan;
+  const taskPlan = Array.isArray(taskPlanRaw)
+    ? taskPlanRaw
+        .map((t) => {
+          const obj = t && typeof t === "object" ? (t as Record<string, unknown>) : null;
+          const title = typeof obj?.title === "string" ? obj.title.trim() : "";
+          if (!title) return null;
+          const statusRaw = typeof obj?.status === "string" ? obj.status.trim() : "";
+          const status =
+            statusRaw === "pending" || statusRaw === "in_progress" || statusRaw === "completed"
+              ? (statusRaw as "pending" | "in_progress" | "completed")
+              : undefined;
+          return { title, ...(status ? { status } : {}) } as { title: string; status?: "pending" | "in_progress" | "completed" };
+        })
+        .filter((x): x is { title: string; status?: "pending" | "in_progress" | "completed" } => Boolean(x))
+    : [];
+  const automationRaw = (parsed as { automation?: unknown }).automation;
+  const automationObj =
+    automationRaw && typeof automationRaw === "object" ? (automationRaw as Record<string, unknown>) : null;
+  const automation = (() => {
+    if (!automationObj) return null;
+    const id = typeof automationObj.id === "string" ? automationObj.id.trim() : "";
+    if (!id) return null;
+    const name = typeof automationObj.name === "string" ? automationObj.name.trim() : "";
+    const cron = typeof automationObj.cron === "string" ? automationObj.cron.trim() : "";
+    const enabled = Boolean(automationObj.enabled);
+    const autoConfirm = Boolean(automationObj.auto_confirm);
+    const confirmTimeoutSeconds =
+      typeof automationObj.confirm_timeout_seconds === "number" && Number.isFinite(automationObj.confirm_timeout_seconds)
+        ? automationObj.confirm_timeout_seconds
+        : 10;
+    const confirmAt = typeof automationObj.confirm_at === "string" ? automationObj.confirm_at : null;
+    return {
+      id,
+      name,
+      cron,
+      enabled,
+      auto_confirm: autoConfirm,
+      confirm_timeout_seconds: confirmTimeoutSeconds,
+      confirm_at: confirmAt,
+    } satisfies NonNullable<BoardAssistantMeta["automation"]>;
+  })();
   const meta: BoardAssistantMeta = {};
   if (docs.length > 0) meta.updated_docs = docs;
   if (steps.length > 0) meta.thinking_steps = steps;
+  if (taskPlan.length > 0) meta.task_plan = taskPlan;
+  if (automation) meta.automation = automation;
   const modelId = (parsed as { model_id?: unknown }).model_id;
   if (typeof modelId === "string" && modelId.trim()) meta.model_id = modelId.trim();
   const tin = (parsed as { tokens_in?: unknown }).tokens_in;
@@ -1251,6 +1310,17 @@ export default function BoardPage() {
   const [quickAction, setQuickAction] = useState<string | null>(null);
   const [chatMessages, setChatMessages] = useState<BoardChatMessage[]>([]);
   const [chatSending, setChatSending] = useState(false);
+  const [pendingAutomationConfirm, setPendingAutomationConfirm] = useState<{
+    id: string;
+    confirmAt: string | null;
+    timeoutSeconds: number;
+  } | null>(null);
+  const pendingAutomationConfirmRef = useRef<{
+    id: string;
+    confirmAt: string | null;
+    timeoutSeconds: number;
+  } | null>(null);
+  const [autoConfirmNow, setAutoConfirmNow] = useState(() => Date.now());
   const [confirmAction, setConfirmAction] = useState<ChatActionConfirm | null>(null);
   const [docDiffs, setDocDiffs] = useState<Record<string, { before: string; after: string }>>({});
   const [boardChatId, setBoardChatId] = useState<string | null>(null);
@@ -1480,6 +1550,50 @@ export default function BoardPage() {
   useEffect(() => {
     chatMessagesRef.current = chatMessages;
   }, [chatMessages]);
+  useEffect(() => {
+    pendingAutomationConfirmRef.current = pendingAutomationConfirm;
+  }, [pendingAutomationConfirm]);
+  useEffect(() => {
+    if (!pendingAutomationConfirm) return;
+    const t = window.setInterval(() => setAutoConfirmNow(Date.now()), 300);
+    return () => window.clearInterval(t);
+  }, [pendingAutomationConfirm]);
+
+  const enableAutomation = useCallback(async (automationId: string) => {
+    const sessionInfo = await getSessionWithTimeout({ timeoutMs: 4500, retries: 2, retryDelayMs: 200 });
+    const token = sessionInfo.session?.access_token ?? "";
+    if (!token) return;
+    await fetch(`/api/automations/${encodeURIComponent(automationId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ enabled: true }),
+    }).catch(() => null);
+  }, []);
+
+  const cancelAutomation = useCallback(async (automationId: string) => {
+    const sessionInfo = await getSessionWithTimeout({ timeoutMs: 4500, retries: 2, retryDelayMs: 200 });
+    const token = sessionInfo.session?.access_token ?? "";
+    if (!token) return;
+    await fetch(`/api/automations/${encodeURIComponent(automationId)}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${token}` },
+    }).catch(() => null);
+  }, []);
+
+  useEffect(() => {
+    if (!pendingAutomationConfirm) return;
+    const confirmAtMs = pendingAutomationConfirm.confirmAt ? Date.parse(pendingAutomationConfirm.confirmAt) : NaN;
+    const delayMs = Number.isFinite(confirmAtMs)
+      ? Math.max(0, confirmAtMs - Date.now())
+      : Math.max(0, pendingAutomationConfirm.timeoutSeconds * 1000);
+    const t = window.setTimeout(() => {
+      const current = pendingAutomationConfirmRef.current;
+      if (!current || current.id !== pendingAutomationConfirm.id) return;
+      void enableAutomation(pendingAutomationConfirm.id);
+      setPendingAutomationConfirm(null);
+    }, delayMs);
+    return () => window.clearTimeout(t);
+  }, [enableAutomation, pendingAutomationConfirm]);
 
   useEffect(() => {
     boardChatIdRef.current = boardChatId;
@@ -3320,17 +3434,23 @@ export default function BoardPage() {
         })();
 
         finishThinking();
-        const finalReply = replyText && replyText.trim() ? replyText.trim() : "The agent did not return a visible reply.";
+        const parsedReply = parseBoardMessageContent(replyText);
+        const finalReply =
+          parsedReply.text && parsedReply.text.trim()
+            ? parsedReply.text.trim()
+            : "The agent did not return a visible reply.";
         const assistantMessageId = crypto.randomUUID();
 
         const tokensInAsk = estimateTokens(pending.requestMessage);
         const tokensOutAsk = estimateTokens(finalReply);
-        const assistantDbContentAsk = buildBoardAssistantDbContent(finalReply, {
+        const mergedMetaAsk: BoardAssistantMeta = {
+          ...(parsedReply.meta ?? {}),
           model_id: pending.modelId,
           tokens_in: tokensInAsk,
           tokens_out: tokensOutAsk,
           tokens_total: tokensInAsk + tokensOutAsk,
-        });
+        };
+        const assistantDbContentAsk = buildBoardAssistantDbContent(finalReply, mergedMetaAsk);
 
         if (currentChatId) {
           void (async () => {
@@ -3349,8 +3469,24 @@ export default function BoardPage() {
 
         setChatMessages((prev) => [
           ...prev,
-          { id: assistantMessageId, role: "assistant", content: finalReply, kind: "normal" },
+          {
+            id: assistantMessageId,
+            role: "assistant",
+            content: finalReply,
+            kind: "normal",
+            steps: metaToChatSteps(assistantMessageId, mergedMetaAsk),
+            meta: mergedMetaAsk,
+          },
         ]);
+        if (mergedMetaAsk.automation && mergedMetaAsk.automation.id && mergedMetaAsk.automation.auto_confirm && !mergedMetaAsk.automation.enabled) {
+          setPendingAutomationConfirm({
+            id: mergedMetaAsk.automation.id,
+            confirmAt: mergedMetaAsk.automation.confirm_at ?? null,
+            timeoutSeconds: mergedMetaAsk.automation.confirm_timeout_seconds ?? 10,
+          });
+        } else {
+          setPendingAutomationConfirm(null);
+        }
 
         return;
       }
@@ -3431,7 +3567,9 @@ export default function BoardPage() {
         }
 
         finishThinking();
-        const replyText = data.reply && data.reply.trim() ? data.reply.trim() : "The agent did not return a visible reply.";
+        const replyRaw = data.reply && data.reply.trim() ? data.reply.trim() : "The agent did not return a visible reply.";
+        const parsedReply = parseBoardMessageContent(replyRaw);
+        const replyText = parsedReply.text && parsedReply.text.trim() ? parsedReply.text.trim() : "The agent did not return a visible reply.";
         const assistantMessageId = streamingAssistantId ?? crypto.randomUUID();
         const updatedDocMetas: BoardAssistantDeliveryDoc[] = Array.isArray(data.updated_docs)
           ? data.updated_docs
@@ -3562,14 +3700,16 @@ export default function BoardPage() {
           thinkingMessage?.steps?.filter((s) => s.type === "info").map((s) => ({ label: s.label })) ?? [];
         const tokensIn = estimateTokens(pending.requestMessage);
         const tokensOut = estimateTokens(replyText);
-        const assistantDbContent = buildBoardAssistantDbContent(replyText, {
+        const mergedMeta: BoardAssistantMeta = {
+          ...(parsedReply.meta ?? {}),
           updated_docs: updatedDocMetas,
           thinking_steps: thinkingSteps,
           model_id: pending.modelId,
           tokens_in: tokensIn,
           tokens_out: tokensOut,
           tokens_total: tokensIn + tokensOut,
-        });
+        };
+        const assistantDbContent = buildBoardAssistantDbContent(replyText, mergedMeta);
 
         if (currentChatId) {
           void (async () => {
@@ -3586,18 +3726,28 @@ export default function BoardPage() {
           })();
         }
 
+        if (mergedMeta.automation && mergedMeta.automation.id && mergedMeta.automation.auto_confirm && !mergedMeta.automation.enabled) {
+          setPendingAutomationConfirm({
+            id: mergedMeta.automation.id,
+            confirmAt: mergedMeta.automation.confirm_at ?? null,
+            timeoutSeconds: mergedMeta.automation.confirm_timeout_seconds ?? 10,
+          });
+        } else {
+          setPendingAutomationConfirm(null);
+        }
+
         if (streamingAssistantId) {
-          const steps = updatedDocMetas.length > 0 ? docsToChatSteps(assistantMessageId, updatedDocMetas) : undefined;
+          const steps = metaToChatSteps(assistantMessageId, mergedMeta);
           setChatMessages((prev) =>
             prev.map((m) =>
-              m.id === assistantMessageId ? { ...m, content: replyText, steps } : m
+              m.id === assistantMessageId ? { ...m, content: replyText, steps, meta: mergedMeta } : m
             )
           );
         } else {
-          const steps = updatedDocMetas.length > 0 ? docsToChatSteps(assistantMessageId, updatedDocMetas) : undefined;
+          const steps = metaToChatSteps(assistantMessageId, mergedMeta);
           setChatMessages((prev) => [
             ...prev,
-            { id: assistantMessageId, role: "assistant", content: replyText, kind: "normal", steps },
+            { id: assistantMessageId, role: "assistant", content: replyText, kind: "normal", steps, meta: mergedMeta },
           ]);
         }
       };
@@ -3924,6 +4074,13 @@ export default function BoardPage() {
   const startChatRound = useCallback(
     (args: { baseMessage: string; requestBase: string; attachedIds: string[]; attachedPathRefs: string[] }) => {
       const { baseMessage, requestBase, attachedIds, attachedPathRefs } = args;
+      const pendingConfirm = pendingAutomationConfirmRef.current;
+      const wantsCancel =
+        /^(取消|停止|终止)\b/.test(baseMessage.trim()) || baseMessage.includes("取消自动化") || baseMessage.includes("取消创建");
+      if (pendingConfirm && wantsCancel) {
+        void cancelAutomation(pendingConfirm.id);
+        setPendingAutomationConfirm(null);
+      }
       const userMessage: BoardChatMessage = {
         id: crypto.randomUUID(),
         role: "user",
@@ -3958,14 +4115,34 @@ export default function BoardPage() {
         content: "Analyzing your instruction...",
         kind: "status",
         steps: initialSteps,
+        meta: {
+          task_plan: [
+            { title: "理解需求与约束", status: "in_progress" },
+            { title: "制定执行步骤", status: "pending" },
+            { title: "执行并反馈结果", status: "pending" },
+          ],
+        },
       };
       setChatMessages((prev) => [...prev, userMessage, thinkingMessage]);
       setMessage("");
       setAttachedResourceIds([]);
       setAttachedPathRefs([]);
 
+      const normalized = baseMessage;
+      const wantsAutomationAsk =
+        chatMode === "create" &&
+        (normalized.includes("自动化") ||
+          normalized.includes("定时") ||
+          normalized.includes("每天") ||
+          normalized.includes("每周") ||
+          normalized.includes("每日") ||
+          normalized.includes("早报") ||
+          normalized.includes("日报") ||
+          /每天\s*(早上|上午|中午|下午|晚上|夜里|凌晨)?\s*\d{1,2}\s*(?:点|时)(?:\s*\d{1,2}\s*分?)?/.test(normalized));
+      const effectiveChatMode: BoardChatMode = wantsAutomationAsk ? "ask" : chatMode;
+
       const modelConfig =
-        chatMode === "ask"
+        effectiveChatMode === "ask"
           ? (MODELS.find((m) => m.id === askDefaultModelId) ?? MODELS[0])
           : (enabledModels.find((m) => m.id === selectedModel) ?? MODELS[0]);
       const history = [
@@ -3978,9 +4155,8 @@ export default function BoardPage() {
         { role: "user" as const, content: withPathRefs(requestBase, attachedPathRefs) },
       ];
 
-      const normalized = baseMessage;
       const useXhsSkill =
-        chatMode === "create" &&
+        effectiveChatMode === "create" &&
         (normalized.includes("小红书图文") ||
           normalized.includes("小红书") ||
           normalized.includes("图文") ||
@@ -4040,7 +4216,7 @@ export default function BoardPage() {
       chatSendQueueRef.current.push({
         id: crypto.randomUUID(),
         userId,
-        mode: chatMode,
+        mode: effectiveChatMode,
         userMessageId: userMessage.id,
         thinkingId,
         rawMessage: baseMessage,
@@ -4105,6 +4281,15 @@ export default function BoardPage() {
     for (let i = chatMessages.length - 1; i >= 0; i -= 1) {
       const m = chatMessages[i];
       if (m && m.kind !== "status" && m.role === "assistant") return m.id;
+    }
+    return null;
+  })();
+  const latestTaskPlan = (() => {
+    for (let i = chatMessages.length - 1; i >= 0; i -= 1) {
+      const m = chatMessages[i];
+      if (!m || m.role !== "assistant") continue;
+      const plan = m.meta?.task_plan;
+      if (plan && plan.length > 0) return plan;
     }
     return null;
   })();
@@ -4977,13 +5162,14 @@ export default function BoardPage() {
                                 ) =>
                                   raw.map((m) => {
                                     const parsed = parseBoardMessageContent(m.content ?? "");
-                                  const steps = m.role === "assistant" ? metaToChatSteps(m.id, parsed.meta) : undefined;
+                                    const steps = m.role === "assistant" ? metaToChatSteps(m.id, parsed.meta) : undefined;
                                     return {
                                       id: m.id,
                                       role: m.role,
                                       content: parsed.text,
                                       kind: "normal",
                                       steps,
+                                      meta: parsed.meta,
                                     } as BoardChatMessage;
                                   });
 
@@ -5104,6 +5290,7 @@ export default function BoardPage() {
                                         content: parsed.text,
                                         kind: "normal",
                                         steps,
+                                        meta: parsed.meta,
                                       } as BoardChatMessage;
                                     })
                                   );
@@ -5385,6 +5572,96 @@ export default function BoardPage() {
                         })()}
                       </div>
                     )}
+                    {m.role === "assistant" && !m.meta?.automation && m.meta?.task_plan && m.meta.task_plan.length > 0 && (
+                      <div className="mr-auto mt-2 flex w-full max-w-[85%] flex-col gap-2 pl-0 text-[11px]">
+                        <div className="rounded-xl border border-zinc-200 bg-white px-3 py-2 text-zinc-800 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100">
+                          <div className="text-[11px] font-semibold">任务清单</div>
+                          <ul className="mt-1 space-y-0.5 text-[10px] text-zinc-600 dark:text-zinc-300">
+                            {m.meta.task_plan.map((t, idx) => (
+                              <li key={`${m.id}:planonly:${idx}`} className="flex items-center gap-1.5">
+                                <span className="h-1.5 w-1.5 rounded-full bg-zinc-400" />
+                                <span className="flex-1 truncate">
+                                  {t.title}
+                                  {t.status && t.status !== "pending" ? ` · ${t.status}` : ""}
+                                </span>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      </div>
+                    )}
+                    {m.role === "assistant" && m.meta?.automation && (
+                      <div className="mr-auto mt-2 flex w-full max-w-[85%] flex-col gap-2 pl-0 text-[11px]">
+                        <div className="rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-amber-900 dark:border-amber-500/60 dark:bg-amber-900/30 dark:text-amber-50">
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex flex-col gap-0.5">
+                              <span className="text-[11px] font-semibold">
+                                自动化任务预览：{m.meta.automation.name || "未命名自动化"}
+                              </span>
+                              <span className="text-[10px] text-amber-800/80 dark:text-amber-100/80">
+                                调度：{m.meta.automation.cron} · 当前状态：{m.meta.automation.enabled ? "已启用" : "待确认"}
+                              </span>
+                            </div>
+                          </div>
+                          {m.meta.task_plan && m.meta.task_plan.length > 0 && (
+                            <div className="mt-2 rounded-lg bg-amber-100/70 px-2 py-1.5 text-[10px] text-amber-900 dark:bg-amber-900/60 dark:text-amber-50">
+                              <div className="mb-1 font-semibold">任务清单</div>
+                              <ul className="space-y-0.5">
+                                {m.meta.task_plan.map((t, idx) => (
+                                  <li key={`${m.id}:plan:${idx}`} className="flex items-center gap-1.5">
+                                    <span className="h-1.5 w-1.5 rounded-full bg-amber-500" />
+                                    <span className="flex-1 truncate">
+                                      {t.title}
+                                      {t.status && t.status !== "pending" ? ` · ${t.status}` : ""}
+                                    </span>
+                                  </li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                          {m.meta.automation.auto_confirm &&
+                            !m.meta.automation.enabled &&
+                            pendingAutomationConfirm?.id === m.meta.automation.id && (
+                            <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px]">
+                              <span>
+                                将在
+                                {(() => {
+                                  const a = m.meta!.automation!;
+                                  const confirmAtMs = a.confirm_at ? Date.parse(a.confirm_at) : NaN;
+                                  const s =
+                                    Number.isFinite(confirmAtMs) ? Math.max(0, Math.ceil((confirmAtMs - autoConfirmNow) / 1000)) : a.confirm_timeout_seconds ?? 10;
+                                  return ` ${s} 秒后自动启用（除非你取消）`;
+                                })()}
+                              </span>
+                              <div className="flex items-center gap-1">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const a = m.meta!.automation!;
+                                    void enableAutomation(a.id);
+                                    setPendingAutomationConfirm(null);
+                                  }}
+                                  className="rounded-md bg-amber-500 px-2 py-1 text-[10px] font-semibold text-white hover:bg-amber-600"
+                                >
+                                  立即启用
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const a = m.meta!.automation!;
+                                    void cancelAutomation(a.id);
+                                    setPendingAutomationConfirm(null);
+                                  }}
+                                  className="rounded-md border border-amber-400 px-2 py-1 text-[10px] font-medium text-amber-900 hover:bg-amber-100 dark:border-amber-500/80 dark:text-amber-50 dark:hover:bg-amber-900/60"
+                                >
+                                  取消并删除
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
                     {m.role === "user" && (
                       <div className="ml-auto mt-1 flex items-center gap-2 text-zinc-400">
                       <div className="relative group">
@@ -5511,6 +5788,25 @@ export default function BoardPage() {
             ref={inputWindowRef}
             className={`${chatMessages.length === 0 ? "mt-4" : "mt-auto"} w-full max-w-full`}
           >
+          {latestTaskPlan && latestTaskPlan.length > 0 && (
+            <div className="mb-2 rounded-2xl border border-zinc-200 bg-white px-3 py-2 text-[11px] text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100">
+              <div className="text-[11px] font-semibold">任务规划</div>
+              <div className="mt-1 flex flex-col gap-1.5">
+                {latestTaskPlan.map((t, idx) => (
+                  <div key={`plan-panel-${idx}`} className="flex items-center gap-2">
+                    {t.status === "completed" ? (
+                      <CheckSquare className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+                    ) : t.status === "in_progress" ? (
+                      <RefreshCw className="h-4 w-4 animate-spin text-zinc-600 dark:text-zinc-300" />
+                    ) : (
+                      <span className="h-4 w-4 rounded border border-zinc-300 bg-white dark:border-zinc-700 dark:bg-zinc-950" />
+                    )}
+                    <div className="min-w-0 flex-1 truncate">{t.title}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
           {(pendingFiles.length > 0 || attachedResourceIds.length > 0 || attachedPathRefs.length > 0) && (
             <div className="mb-2 rounded-t-2xl border border-b-0 border-zinc-200 bg-white px-3 py-1 text-xs text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900">
               <div className="flex items-center justify-between gap-3">

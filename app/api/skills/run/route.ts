@@ -29,6 +29,18 @@ export async function POST(req: Request) {
     return Response.json({ error: "id is required" }, { status: 400 });
   }
 
+  try {
+    const db = await getMongoDb();
+    const state = await db
+      .collection<{ userId: string; skillId: string; installed: boolean }>("user_skill_states")
+      .findOne({ userId: auth.user.id, skillId: id, installed: false });
+    if (state) {
+      return Response.json({ error: "Skill not installed" }, { status: 403 });
+    }
+  } catch {
+    void 0;
+  }
+
   let effectiveModelId = modelId;
   try {
     const db = await getMongoDb();

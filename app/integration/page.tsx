@@ -67,6 +67,11 @@ export default function IntegrationPage() {
     workspaceId: string | null;
     workspaceName: string | null;
     botId: string | null;
+    botName?: string | null;
+    botAvatarUrl?: string | null;
+    userId?: string | null;
+    userName?: string | null;
+    userAvatarUrl?: string | null;
     requestId?: string | null;
   } | null>(null);
   const [justConnected, setJustConnected] = useState(false);
@@ -290,6 +295,11 @@ export default function IntegrationPage() {
         workspaceId: asStringOrNull(json?.workspaceId),
         workspaceName: asStringOrNull(json?.workspaceName),
         botId: asStringOrNull(json?.botId),
+        botName: asStringOrNull(json?.botName),
+        botAvatarUrl: asStringOrNull(json?.botAvatarUrl),
+        userId: asStringOrNull(json?.userId),
+        userName: asStringOrNull(json?.userName),
+        userAvatarUrl: asStringOrNull(json?.userAvatarUrl),
         requestId: asStringOrNull(json?.requestId) ?? res.headers.get("x-request-id") ?? null,
       });
     } catch (error: unknown) {
@@ -311,6 +321,8 @@ export default function IntegrationPage() {
     const error = url.searchParams.get("error");
     const requestId = url.searchParams.get("requestId");
     if (connected) {
+      if (connected === "twitter") setActiveTab("socialmedia");
+      if (connected === "google_calendar" || connected === "notion") setActiveTab("platforms");
       setJustConnected(true);
       const message = (() => {
         if (connected === "twitter") {
@@ -1112,14 +1124,27 @@ export default function IntegrationPage() {
                             <div className="relative flex flex-col gap-3 rounded-lg border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
                               <div className="absolute -left-3 top-1/2 h-px w-3 bg-zinc-200 dark:bg-zinc-800" />
                               <div className="flex items-center gap-3">
-                                <div className="h-10 w-10 rounded-full bg-zinc-100 flex items-center justify-center dark:bg-zinc-800">
-                                  <svg className="h-6 w-6 text-zinc-900 dark:text-zinc-100" viewBox="0 0 24 24" fill="currentColor">
-                                    <path d="M4.223 3.525L2.68 4.607A.75.75 0 002.5 5.5l.5.75a.75.75 0 001.054.214l.87-.58a2.25 2.25 0 012.352-.075l.38.213c.84.47 1.344 1.32 1.344 2.25v8.667c0 1.258-1.392 2.016-2.482 1.352l-.398-.24a2.25 2.25 0 00-2.352.076l-.088.058a.75.75 0 00.83 1.246l.088-.058a.75.75 0 01.784-.026l.398.24c.484.294 1.04.258 1.488-.095.448-.352.708-.894.708-1.47V9.333c0-.413-.224-.79-.597-1.002l-.38-.212a.75.75 0 00-.784.025l-.87.58a2.25 2.25 0 01-3.16-1.874V6.5a2.25 2.25 0 011.664-2.172l1.542-1.08a.75.75 0 00.322-.976l-.5-.75a.75.75 0 00-1.054-.214zM21.5 5.5l-.5-.75a.75.75 0 00-1.054-.214l-1.542 1.08A2.25 2.25 0 0016.74 7.788v.377a2.25 2.25 0 00-3.16 1.874l-.87-.58a.75.75 0 00-.784-.025l-.38.212A1.17 1.17 0 0010.95 10.667v8.666c0 .576.26 1.118.708 1.47.448.353 1.004.39 1.488.096l.398-.24a.75.75 0 01.784.026l.088.058a.75.75 0 10.83-1.246l-.088-.058a2.25 2.25 0 00-2.352-.076l-.398.24c-1.09.664-2.482-.094-2.482-1.352V9.333c0-.93.504-1.78 1.344-2.25l.38-.213a2.25 2.25 0 012.352.075l.87.58a.75.75 0 001.054-.214l.5-.75a.75.75 0 00-.214-1.054l-1.542-1.08a.75.75 0 00-.322.976v.377c0 .93.504 1.78 1.344 2.25l.38.213c.84.47 1.344 1.32 1.344 2.25v8.667c0 1.258-1.392 2.016-2.482 1.352l-.398-.24a2.25 2.25 0 00-2.352.076l-.088.058a.75.75 0 00.83 1.246l.088-.058a.75.75 0 01.784-.026l.398.24c.484.294 1.04.258 1.488-.095.448-.352.708-.894.708-1.47V9.333c0-.413-.224-.79-.597-1.002l-.38-.212a.75.75 0 00-.784.025l-.87.58a2.25 2.25 0 01-3.16-1.874V6.5a2.25 2.25 0 011.664-2.172l1.542-1.08a.75.75 0 00.322-.976l-.5-.75a.75.75 0 00-1.054-.214z"/>
-                                  </svg>
-                                </div>
+                                {notionStatus.userAvatarUrl || notionStatus.botAvatarUrl ? (
+                                  <img
+                                    src={notionStatus.userAvatarUrl || notionStatus.botAvatarUrl || ""}
+                                    alt=""
+                                    className="h-10 w-10 rounded-full border border-zinc-200 object-cover dark:border-zinc-800"
+                                    referrerPolicy="no-referrer"
+                                  />
+                                ) : (
+                                  <div className="h-10 w-10 rounded-full bg-zinc-100 flex items-center justify-center dark:bg-zinc-800">
+                                    <svg className="h-6 w-6 text-zinc-900 dark:text-zinc-100" viewBox="0 0 24 24" fill="currentColor">
+                                      <path d="M4.223 3.525L2.68 4.607A.75.75 0 002.5 5.5l.5.75a.75.75 0 001.054.214l.87-.58a2.25 2.25 0 012.352-.075l.38.213c.84.47 1.344 1.32 1.344 2.25v8.667c0 1.258-1.392 2.016-2.482 1.352l-.398-.24a2.25 2.25 0 00-2.352.076l-.088.058a.75.75 0 00.83 1.246l.088-.058a.75.75 0 01.784-.026l.398.24c.484.294 1.04.258 1.488-.095.448-.352.708-.894.708-1.47V9.333c0-.413-.224-.79-.597-1.002l-.38-.212a.75.75 0 00-.784.025l-.87.58a2.25 2.25 0 01-3.16-1.874V6.5a2.25 2.25 0 011.664-2.172l1.542-1.08a.75.75 0 00.322-.976l-.5-.75a.75.75 0 00-1.054-.214zM21.5 5.5l-.5-.75a.75.75 0 00-1.054-.214l-1.542 1.08A2.25 2.25 0 0016.74 7.788v.377a2.25 2.25 0 00-3.16 1.874l-.87-.58a.75.75 0 00-.784-.025l-.38.212A1.17 1.17 0 0010.95 10.667v8.666c0 .576.26 1.118.708 1.47.448.353 1.004.39 1.488.096l.398-.24a.75.75 0 01.784.026l.088.058a.75.75 0 10.83-1.246l-.088-.058a2.25 2.25 0 00-2.352-.076l-.398.24c-1.09.664-2.482-.094-2.482-1.352V9.333c0-.93.504-1.78 1.344-2.25l.38-.213a2.25 2.25 0 012.352.075l.87.58a.75.75 0 001.054-.214l.5-.75a.75.75 0 00-.214-1.054l-1.542-1.08a.75.75 0 00-.322.976v.377c0 .93.504 1.78 1.344 2.25l.38.213c.84.47 1.344 1.32 1.344 2.25v8.667c0 1.258-1.392 2.016-2.482 1.352l-.398-.24a2.25 2.25 0 00-2.352.076l-.088.058a.75.75 0 00.83 1.246l.088-.058a.75.75 0 01.784-.026l.398.24c.484.294 1.04.258 1.488-.095.448-.352.708-.894.708-1.47V9.333c0-.413-.224-.79-.597-1.002l-.38-.212a.75.75 0 00-.784.025l-.87.58a2.25 2.25 0 01-3.16-1.874V6.5a2.25 2.25 0 011.664-2.172l1.542-1.08a.75.75 0 00.322-.976l-.5-.75a.75.75 0 00-1.054-.214z"/>
+                                    </svg>
+                                  </div>
+                                )}
                                 <div className="min-w-0 flex-1">
                                   <div className="truncate text-sm font-medium text-zinc-900 dark:text-zinc-100">
-                                    {notionStatus.workspaceName || notionStatus.workspaceId || "Notion Workspace"}
+                                    {notionStatus.userName ||
+                                      notionStatus.workspaceName ||
+                                      notionStatus.workspaceId ||
+                                      notionStatus.botName ||
+                                      "Notion Workspace"}
                                   </div>
                                   {notionStatus.botId && (
                                     <div className="truncate text-xs text-zinc-500 dark:text-zinc-400">

@@ -2,6 +2,8 @@ import { createClient } from "@supabase/supabase-js";
 import { getUserFromRequest } from "@/lib/supabaseAuthServer";
 import { ensureUserIndexUpToDate, getUserPersonaIds, pickRagEmbeddingsConfig, retrieveRelevantDocs } from "@/lib/rag";
 import { AIPERSONA_SYSTEM_PROMPT } from "@/lib/prompts"; // 导入调优后的提示词
+import { getMongoDb } from "@/lib/mongodb";
+import { syncAutomationScheduler, type AutomationDoc } from "@/lib/automationScheduler";
 
 export const runtime = "nodejs";
 
@@ -303,6 +305,237 @@ function safeMessages(value: unknown): ChatMessage[] {
   return out;
 }
 
+function normalizeOrigin(value: string) {
+  return value.replace(/\/+$/, "");
+}
+
+function getPublicOrigin(req: Request) {
+  const proto = (req.headers.get("x-forwarded-proto") ?? "").toString().trim();
+  const host = (req.headers.get("x-forwarded-host") ?? req.headers.get("host") ?? "").toString().trim();
+  if (proto && host) return normalizeOrigin(`${proto}://${host}`);
+  try {
+    return normalizeOrigin(new URL(req.url).origin);
+  } catch {
+    const envOrigin = (process.env.NEXT_PUBLIC_SITE_URL ?? "").toString().trim();
+    return envOrigin ? normalizeOrigin(envOrigin) : "";
+  }
+}
+
+function extractJson(text: string): unknown | null {
+  const first = text.indexOf("{");
+  const last = text.lastIndexOf("}");
+  if (first === -1 || last === -1 || last <= first) return null;
+  const slice = text.slice(first, last + 1);
+  try {
+    return JSON.parse(slice);
+  } catch {
+    return null;
+  }
+}
+
+function parseCronFromChinese(text: string): { cron: string; timezoneHint: string } | null {
+  const raw = (text ?? "").toString();
+  if (!raw.includes("每天")) return null;
+  const re =
+    /每天\s*(早上|上午|中午|下午|晚上|夜里|凌晨)?\s*(\d{1,2})\s*(?:点|时)(?:\s*(\d{1,2})\s*分?)?/;
+  const m = re.exec(raw);
+  if (!m) return null;
+  const period = (m[1] ?? "").toString();
+  const hourRaw = Number(m[2]);
+  const minuteRaw = m[3] ? Number(m[3]) : 0;
+  if (!Number.isFinite(hourRaw) || !Number.isFinite(minuteRaw)) return null;
+  if (hourRaw < 0 || hourRaw > 23 || minuteRaw < 0 || minuteRaw > 59) return null;
+  let hour = hourRaw;
+  const isPm = period === "下午" || period === "晚上" || period === "夜里" || period === "中午";
+  if (isPm && hour < 12) hour += 12;
+  if (period === "凌晨" && hour === 12) hour = 0;
+  const cron = `${minuteRaw} ${hour} * * *`;
+  return { cron, timezoneHint: "Asia/Shanghai" };
+}
+
+function parseCronFromEnglish(text: string): { cron: string; timezoneHint: string } | null {
+  const raw = (text ?? "").toString().trim();
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+  if (!/(every\s+day|daily|each\s+day)/.test(lower)) return null;
+  const patterns: RegExp[] = [
+    /\b(?:every\s+day|daily|each\s+day)\b[\s,]*(?:at\s*)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i,
+    /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b[\s,]*(?:every\s+day|daily|each\s+day)\b/i,
+    /\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b[\s,]*(?:every\s+day|daily|each\s+day)\b/i,
+  ];
+  let m: RegExpExecArray | null = null;
+  for (const re of patterns) {
+    m = re.exec(raw);
+    if (m) break;
+  }
+  if (!m) return null;
+  const hourRaw = Number(m[1]);
+  const minuteRaw = m[2] ? Number(m[2]) : 0;
+  const ampm = (m[3] ?? "").toString().toLowerCase();
+  if (!Number.isFinite(hourRaw) || !Number.isFinite(minuteRaw)) return null;
+  if (minuteRaw < 0 || minuteRaw > 59) return null;
+  let hour = hourRaw;
+  if (ampm) {
+    if (hour < 1 || hour > 12) return null;
+    if (ampm === "am") {
+      if (hour === 12) hour = 0;
+    } else if (ampm === "pm") {
+      if (hour !== 12) hour += 12;
+    } else {
+      return null;
+    }
+  } else {
+    if (hour < 0 || hour > 23) return null;
+  }
+  const cron = `${minuteRaw} ${hour} * * *`;
+  return { cron, timezoneHint: "UTC" };
+}
+
+function inferCronFromMessage(text: string) {
+  return parseCronFromChinese(text) || parseCronFromEnglish(text);
+}
+
+function isValidTimezoneName(value: string) {
+  const s = (value ?? "").toString().trim();
+  if (!s) return false;
+  if (!s.includes("/")) return false;
+  if (/\s/.test(s)) return false;
+  return true;
+}
+
+function inferTimezoneFromCountry(country: string): string | null {
+  const code = (country ?? "").toString().trim().toUpperCase();
+  if (!code) return null;
+  const map: Record<string, string> = {
+    CN: "Asia/Shanghai",
+    HK: "Asia/Hong_Kong",
+    TW: "Asia/Taipei",
+    MO: "Asia/Macau",
+    JP: "Asia/Tokyo",
+    KR: "Asia/Seoul",
+    SG: "Asia/Singapore",
+    IN: "Asia/Kolkata",
+    TH: "Asia/Bangkok",
+    VN: "Asia/Ho_Chi_Minh",
+    ID: "Asia/Jakarta",
+    PH: "Asia/Manila",
+    AU: "Australia/Sydney",
+    NZ: "Pacific/Auckland",
+    GB: "Europe/London",
+    IE: "Europe/Dublin",
+    FR: "Europe/Paris",
+    DE: "Europe/Berlin",
+    ES: "Europe/Madrid",
+    IT: "Europe/Rome",
+    NL: "Europe/Amsterdam",
+    BE: "Europe/Brussels",
+    CH: "Europe/Zurich",
+    AT: "Europe/Vienna",
+    SE: "Europe/Stockholm",
+    NO: "Europe/Oslo",
+    DK: "Europe/Copenhagen",
+    FI: "Europe/Helsinki",
+    PL: "Europe/Warsaw",
+    CZ: "Europe/Prague",
+    PT: "Europe/Lisbon",
+    RU: "Europe/Moscow",
+    TR: "Europe/Istanbul",
+    IL: "Asia/Jerusalem",
+    SA: "Asia/Riyadh",
+    AE: "Asia/Dubai",
+    ZA: "Africa/Johannesburg",
+    NG: "Africa/Lagos",
+    EG: "Africa/Cairo",
+    BR: "America/Sao_Paulo",
+    AR: "America/Argentina/Buenos_Aires",
+    CL: "America/Santiago",
+    CO: "America/Bogota",
+    PE: "America/Lima",
+    MX: "America/Mexico_City",
+    CA: "America/Toronto",
+    US: "America/New_York",
+  };
+  return map[code] || null;
+}
+
+function inferAutomationKind(text: string): { kind: "ai_news_briefing" | "competitor_monitor" | "other"; target: string } {
+  const raw = (text ?? "").toString().trim();
+  const lower = raw.toLowerCase();
+  if (/早报|新闻|资讯/.test(raw) && (raw.includes("AI") || raw.includes("ai") || /人工智能/.test(raw) || lower.includes("ai"))) {
+    return { kind: "ai_news_briefing", target: "AI新闻早报" };
+  }
+  if (raw.includes("竞品") || raw.includes("竞对") || lower.includes("competitor")) {
+    return { kind: "competitor_monitor", target: raw.slice(0, 80) };
+  }
+  return { kind: "other", target: raw.slice(0, 80) };
+}
+
+function normalizeThinkingSteps(value: unknown): Array<{ label: string }> {
+  if (!Array.isArray(value)) return [];
+  const out: Array<{ label: string }> = [];
+  for (const it of value) {
+    const obj = it && typeof it === "object" ? (it as Record<string, unknown>) : null;
+    if (!obj) continue;
+    const label = typeof obj.label === "string" ? obj.label.trim() : "";
+    if (!label) continue;
+    out.push({ label });
+  }
+  return out.slice(0, 20);
+}
+
+function normalizeTaskPlan(value: unknown): Array<{ title: string; status?: "pending" | "in_progress" | "completed" }> {
+  if (!Array.isArray(value)) return [];
+  const out: Array<{ title: string; status?: "pending" | "in_progress" | "completed" }> = [];
+  for (const it of value) {
+    const obj = it && typeof it === "object" ? (it as Record<string, unknown>) : null;
+    if (!obj) continue;
+    const title = typeof obj.title === "string" ? obj.title.trim() : "";
+    if (!title) continue;
+    const statusRaw = typeof obj.status === "string" ? obj.status.trim() : "";
+    const status =
+      statusRaw === "pending" || statusRaw === "in_progress" || statusRaw === "completed"
+        ? (statusRaw as "pending" | "in_progress" | "completed")
+        : undefined;
+    out.push({ title, ...(status ? { status } : {}) });
+  }
+  return out.slice(0, 12);
+}
+
+async function createAutomationFromAgent(args: {
+  userId: string;
+  origin: string;
+  name: string;
+  cron: string;
+  timezone: string | null;
+  todos: Array<{ text: string; done: boolean }>;
+  internal: Record<string, unknown>;
+  enabled?: boolean;
+  previewConfig?: { enabled: boolean; auto_confirm: boolean; confirm_timeout_seconds: number } | null;
+}) {
+  const now = new Date();
+  const id = crypto.randomUUID();
+  const db = await getMongoDb();
+  await db.collection<AutomationDoc & { internal?: Record<string, unknown> }>("automations").insertOne({
+    _id: id,
+    userId: args.userId,
+    name: args.name,
+    enabled: args.enabled ?? true,
+    cron: args.cron,
+    timezone: args.timezone,
+    webhookUrl: `${args.origin}/api/automations/webhook`,
+    internal: args.internal,
+    previewConfig: args.previewConfig ?? null,
+    todos: args.todos.map((t) => ({ _id: crypto.randomUUID(), text: t.text, done: t.done, createdAt: now })),
+    lastRunAt: null,
+    lastRunOk: null,
+    lastError: null,
+    createdAt: now,
+    updatedAt: now,
+  });
+  await syncAutomationScheduler().catch(() => null);
+  return id;
+}
+
 function creditsPerRequestForModelKey(modelKey: string | null | undefined): number {
   if (modelKey === "gpt-oss") return 0;
   if (modelKey === "claude-3.5-sonnet") return 3;
@@ -417,6 +650,10 @@ export async function POST(req: Request) {
     if (lookedUp) country = lookedUp;
   }
   const isMainlandChina = country === "CN";
+  const directTimezone =
+    getHeader(req.headers, ["x-vercel-ip-timezone"]) || getHeader(req.headers, ["cf-timezone"]) || getHeader(req.headers, ["x-timezone"]);
+  const countryTimezone = country ? inferTimezoneFromCountry(country) : null;
+  const requestTimezone = (directTimezone && isValidTimezoneName(directTimezone) ? directTimezone : countryTimezone) || (isMainlandChina ? "Asia/Shanghai" : "UTC");
   const defaultModelKey = isMainlandChina ? "ask-default-cn" : "ask-default";
   const primaryModelKey = modelKey || defaultModelKey;
   const fallbackCandidates = isMainlandChina
@@ -460,7 +697,25 @@ export async function POST(req: Request) {
   // 注入调优后的系统提示词 (AIPersona Strategic Orchestrator)
   const systemMsg: ChatMessage = {
     role: "system",
-    content: AIPERSONA_SYSTEM_PROMPT,
+    content: `${AIPERSONA_SYSTEM_PROMPT}
+
+## Output Contract (Strict)
+You MUST respond with a single JSON object only (no Markdown fences, no extra text).
+Schema:
+{
+  "reply": "string",
+  "thinking_steps": [{"label": "string"}],
+  "task_plan": [{"title":"string","status":"pending|in_progress|completed"}],
+  "automation": {
+    "auto_create": true|false,
+    "name": "string",
+    "cron": "string (5-field cron)",
+    "timezone": "string|null",
+    "kind": "ai_news_briefing|competitor_monitor|other",
+    "target": "string"
+  }
+}
+If user requests a recurring schedule (e.g. every day 9am), include automation.auto_create=true with a valid cron/timezone.`,
   };
 
   if (ragEnabled && ragEmbeddings) {
@@ -592,6 +847,134 @@ export async function POST(req: Request) {
         void 0;
       }
 
+      const rawContent = (() => {
+        if (!data || typeof data !== "object") return "";
+        const obj = data as { choices?: Array<{ message?: { content?: unknown } }> };
+        const first = Array.isArray(obj.choices) && obj.choices.length > 0 ? obj.choices[0] : null;
+        const msg = first && first.message ? first.message : null;
+        if (msg && typeof msg.content === "string") return msg.content as string;
+        if (msg && Array.isArray(msg.content)) {
+          const parts = (msg.content as Array<{ text?: string }>)
+            .map((p) => (typeof p?.text === "string" ? p.text.trim() : ""))
+            .filter(Boolean);
+          return parts.join("\n");
+        }
+        return "";
+      })();
+
+      const lastUserText = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
+      const parsed = extractJson(rawContent);
+      const parsedObj = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+      const replyTextRaw = parsedObj && typeof parsedObj.reply === "string" ? parsedObj.reply.trim() : "";
+      let replyText = replyTextRaw || rawContent || "The agent did not return a visible reply.";
+      const thinkingSteps = normalizeThinkingSteps(parsedObj?.thinking_steps);
+      let taskPlan = normalizeTaskPlan(parsedObj?.task_plan);
+
+      const origin = getPublicOrigin(req);
+      const inferredCron = inferCronFromMessage(lastUserText);
+      const automationObj = parsedObj?.automation && typeof parsedObj.automation === "object" ? (parsedObj.automation as Record<string, unknown>) : null;
+      const automationAutoCreate = Boolean(automationObj?.auto_create);
+      const automationNameRaw = typeof automationObj?.name === "string" ? automationObj.name.trim() : "";
+      const automationCronRaw = typeof automationObj?.cron === "string" ? automationObj.cron.trim() : "";
+      const automationTzRaw = typeof automationObj?.timezone === "string" ? automationObj.timezone.trim() : "";
+      const automationKindRaw = typeof automationObj?.kind === "string" ? automationObj.kind.trim() : "";
+      const automationTargetRaw = typeof automationObj?.target === "string" ? automationObj.target.trim() : "";
+      const { kind: inferredKind, target: inferredTarget } = inferAutomationKind(lastUserText.toString());
+      const automationKind = (automationKindRaw || inferredKind) as "ai_news_briefing" | "competitor_monitor" | "other";
+      const automationTarget = automationTargetRaw || inferredTarget;
+
+      const shouldCreateAutomation =
+        origin &&
+        (automationAutoCreate || Boolean(inferredCron)) &&
+        (automationCronRaw || inferredCron?.cron) &&
+        (automationNameRaw || lastUserText.trim());
+
+      let createdAutomation: { id: string; name: string; cron: string; enabled: boolean } | null = null;
+      let autoConfirmAt: string | null = null;
+      if (shouldCreateAutomation) {
+        const cron = automationCronRaw || inferredCron!.cron;
+        const timezone =
+          (automationTzRaw || requestTimezone || inferredCron?.timezoneHint || (isMainlandChina ? "Asia/Shanghai" : "UTC")).trim() ||
+          (isMainlandChina ? "Asia/Shanghai" : "UTC");
+        const name =
+          automationNameRaw ||
+          (automationKind === "ai_news_briefing"
+            ? "AI新闻早报"
+            : automationKind === "competitor_monitor"
+              ? `竞品监控：${automationTarget}`
+              : `自动化任务：${(lastUserText ?? "").toString().slice(0, 24)}`);
+        const internal =
+          automationKind === "ai_news_briefing"
+            ? { kind: automationKind, topic: automationTarget || "AI新闻早报", source: "chat", model_key: cfg.id }
+            : {
+                kind: automationKind,
+                target: automationTarget || (lastUserText ?? "").toString().slice(0, 80),
+                source: "chat",
+                model_key: cfg.id,
+              };
+        const confirmTimeoutSeconds = 10;
+        autoConfirmAt = new Date(Date.now() + confirmTimeoutSeconds * 1000).toISOString();
+        const todosFromPlan =
+          taskPlan.length > 0
+            ? taskPlan
+            : [
+                { title: "解析监控目标", status: "pending" as const },
+                { title: "拉取最新信息", status: "pending" as const },
+                { title: "生成摘要报告", status: "pending" as const },
+                { title: "保存到资源库", status: "pending" as const },
+              ];
+        const todos = todosFromPlan.map((t) => ({ text: t.title, done: t.status === "completed" }));
+        const id = await createAutomationFromAgent({
+          userId: auth.user.id,
+          origin,
+          name,
+          cron,
+          timezone: timezone || null,
+          todos,
+          internal,
+          enabled: false,
+          previewConfig: { enabled: true, auto_confirm: true, confirm_timeout_seconds: confirmTimeoutSeconds },
+        });
+        createdAutomation = { id, name, cron, enabled: false };
+        if (taskPlan.length === 0) taskPlan = todosFromPlan;
+      }
+      if (createdAutomation && autoConfirmAt) {
+        const note =
+          "\n\n我将于10秒后按以上配置创建并启用该自动化任务；如需取消或修改，请在倒计时结束前告知我。";
+        if (!replyText.includes("10秒后")) replyText = `${replyText}${note}`;
+      }
+
+      const meta = {
+        ...(thinkingSteps.length > 0 ? { thinking_steps: thinkingSteps } : {}),
+        ...(taskPlan.length > 0 ? { task_plan: taskPlan } : {}),
+        ...(createdAutomation
+          ? {
+              automation: {
+                ...createdAutomation,
+                auto_confirm: true,
+                confirm_timeout_seconds: 10,
+                confirm_at: autoConfirmAt,
+              },
+            }
+          : {}),
+      } as Record<string, unknown>;
+
+      const BOARD_MESSAGE_META_DELIMITER = "\n---AIPERSONA_META---\n";
+      const patchedContent =
+        Object.keys(meta).length > 0 ? `${replyText}${BOARD_MESSAGE_META_DELIMITER}${JSON.stringify(meta)}` : replyText;
+
+      const patchedData =
+        data && typeof data === "object" ? ({ ...(data as Record<string, unknown>) } as Record<string, unknown>) : null;
+      if (patchedData && Array.isArray((patchedData as { choices?: unknown }).choices)) {
+        const choices = (patchedData as { choices: unknown[] }).choices;
+        const firstChoice = choices[0] && typeof choices[0] === "object" ? (choices[0] as Record<string, unknown>) : {};
+        const firstMsg =
+          firstChoice.message && typeof firstChoice.message === "object" ? (firstChoice.message as Record<string, unknown>) : {};
+        firstMsg.content = patchedContent;
+        firstChoice.message = firstMsg;
+        (patchedData as { choices: unknown[] }).choices = [firstChoice, ...choices.slice(1)];
+      }
+
       console.info("[chat/complete] task_completed", {
         taskId,
         requestId,
@@ -602,10 +985,10 @@ export async function POST(req: Request) {
         chosenModelId: cfg.modelId,
       });
 
-      if (data && typeof data === "object") {
-        return Response.json({ ...(data as Record<string, unknown>), task_id: taskId, credits_used: creditsUsed }, { status: 200 });
+      if (patchedData && typeof patchedData === "object") {
+        return Response.json({ ...(patchedData as Record<string, unknown>), task_id: taskId, credits_used: creditsUsed }, { status: 200 });
       }
-      return Response.json({ data, task_id: taskId, credits_used: creditsUsed }, { status: 200 });
+      return Response.json({ data: patchedData ?? data, task_id: taskId, credits_used: creditsUsed }, { status: 200 });
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Upstream request failed";
       console.error("[chat/complete] candidate_error", { taskId, requestId, userId: auth.user.id, candidateId, error: msg });

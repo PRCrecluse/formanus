@@ -52,7 +52,16 @@ export async function GET(req: NextRequest) {
   const requestId = crypto.randomUUID();
   const envOrigin = (process.env.NEXT_PUBLIC_SITE_URL ?? "").toString().trim();
   const origin = getPublicOrigin(req) || normalizeOrigin(envOrigin) || new URL(req.url).origin;
-  const redirectBase = `${origin}/integration`;
+  const redirectBase = new URL(`${origin}/integration`);
+  redirectBase.searchParams.set("tab", "platforms");
+
+  const buildRedirectUrl = (params: Record<string, string | undefined>) => {
+    const nextUrl = new URL(redirectBase.toString());
+    for (const [key, value] of Object.entries(params)) {
+      if (typeof value === "string" && value.length > 0) nextUrl.searchParams.set(key, value);
+    }
+    return nextUrl.toString();
+  };
 
   const url = new URL(req.url);
   const code = (url.searchParams.get("code") ?? "").trim();
@@ -61,7 +70,7 @@ export async function GET(req: NextRequest) {
   const errorDesc = (url.searchParams.get("error_description") ?? "").trim();
 
   if (errorParam) {
-    const res = NextResponse.redirect(`${redirectBase}?error=${encodeURIComponent(errorDesc || errorParam)}`);
+    const res = NextResponse.redirect(buildRedirectUrl({ error: errorDesc || errorParam }));
     clearCookies(res);
     return res;
   }
@@ -84,10 +93,9 @@ export async function GET(req: NextRequest) {
       xForwardedProto: req.headers.get("x-forwarded-proto"),
       origin,
     });
-    const res = NextResponse.redirect(
-      `${redirectBase}?error=invalid_oauth_state&requestId=${encodeURIComponent(requestId)}`,
-      { headers: { "x-request-id": requestId } }
-    );
+    const res = NextResponse.redirect(buildRedirectUrl({ error: "invalid_oauth_state", requestId }), {
+      headers: { "x-request-id": requestId },
+    });
     clearCookies(res);
     return res;
   }
@@ -95,10 +103,9 @@ export async function GET(req: NextRequest) {
   const clientId = (process.env.GOOGLE_CALENDAR_CLIENT_ID ?? "").toString().trim();
   const clientSecret = (process.env.GOOGLE_CALENDAR_CLIENT_SECRET ?? "").toString().trim();
   if (!clientId || !clientSecret) {
-    const res = NextResponse.redirect(
-      `${redirectBase}?error=missing_google_calendar_client_credentials&requestId=${encodeURIComponent(requestId)}`,
-      { headers: { "x-request-id": requestId } }
-    );
+    const res = NextResponse.redirect(buildRedirectUrl({ error: "missing_google_calendar_client_credentials", requestId }), {
+      headers: { "x-request-id": requestId },
+    });
     clearCookies(res);
     return res;
   }
@@ -130,7 +137,10 @@ export async function GET(req: NextRequest) {
       hasAccessToken: Boolean(tokenJson?.access_token),
     });
     const res = NextResponse.redirect(
-      `${redirectBase}?error=${encodeURIComponent(tokenJson.error_description || tokenJson.error || "token_exchange_failed")}&requestId=${encodeURIComponent(requestId)}`
+      buildRedirectUrl({
+        error: tokenJson.error_description || tokenJson.error || "token_exchange_failed",
+        requestId,
+      })
     );
     clearCookies(res);
     return res;
@@ -138,7 +148,7 @@ export async function GET(req: NextRequest) {
 
   const user = await getSupabaseUser(supabaseToken);
   if (!user) {
-    const res = NextResponse.redirect(`${redirectBase}?error=unauthorized&requestId=${encodeURIComponent(requestId)}`);
+    const res = NextResponse.redirect(buildRedirectUrl({ error: "unauthorized", requestId }));
     clearCookies(res);
     return res;
   }
@@ -167,10 +177,7 @@ export async function GET(req: NextRequest) {
     { upsert: true }
   );
 
-  const res = NextResponse.redirect(`${redirectBase}?connected=google_calendar&requestId=${encodeURIComponent(requestId)}`, {
-    headers: { "x-request-id": requestId },
-  });
+  const res = NextResponse.redirect(buildRedirectUrl({ connected: "google_calendar", requestId }), { headers: { "x-request-id": requestId } });
   clearCookies(res);
   return res;
 }
-

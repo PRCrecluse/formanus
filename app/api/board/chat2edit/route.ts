@@ -7,6 +7,8 @@ import {
   retrieveRelevantDocs,
 } from "@/lib/rag";
 import { getUserFromRequest } from "@/lib/supabaseAuthServer";
+import { getMongoDb } from "@/lib/mongodb";
+import { syncAutomationScheduler, type AutomationDoc } from "@/lib/automationScheduler";
 import { ChatOpenAI } from "@langchain/openai";
 import { ChatPromptTemplate } from "@langchain/core/prompts";
 import { makePersonaDocDbId } from "@/lib/utils";
@@ -299,6 +301,247 @@ function isChineseText(text: string) {
 
 function normalizeChatMode(value: unknown): "ask" | "create" {
   return value === "ask" ? "ask" : "create";
+}
+
+const BOARD_MESSAGE_META_DELIMITER = "\n---AIPERSONA_META---\n";
+
+function normalizeOrigin(origin: string) {
+  const raw = (origin ?? "").toString().trim();
+  if (!raw) return "";
+  return raw.replace(/\/+$/g, "");
+}
+
+function getPublicOrigin(req: Request) {
+  try {
+    return normalizeOrigin(new URL(req.url).origin);
+  } catch {
+    const envOrigin = (process.env.NEXT_PUBLIC_SITE_URL ?? "").toString().trim();
+    return envOrigin ? normalizeOrigin(envOrigin) : "";
+  }
+}
+
+function parseCronFromChinese(text: string): { cron: string; timezoneHint: string } | null {
+  const raw = (text ?? "").toString();
+  if (!raw.includes("每天") && !raw.includes("每日")) return null;
+  const re =
+    /(每天|每日)\s*(早上|上午|中午|下午|晚上|夜里|凌晨)?\s*(\d{1,2})(?:\s*[:：]\s*(\d{1,2}))?\s*(?:点|时)?(?:\s*(\d{1,2})\s*分?)?/;
+  const m = re.exec(raw);
+  if (!m) return null;
+  const period = (m[2] ?? "").toString();
+  const hourRaw = Number(m[3]);
+  const minuteFromColon = m[4] ? Number(m[4]) : NaN;
+  const minuteFromSuffix = m[5] ? Number(m[5]) : NaN;
+  const minuteRaw = Number.isFinite(minuteFromColon) ? minuteFromColon : Number.isFinite(minuteFromSuffix) ? minuteFromSuffix : 0;
+  if (!Number.isFinite(hourRaw) || !Number.isFinite(minuteRaw)) return null;
+  if (hourRaw < 0 || hourRaw > 23 || minuteRaw < 0 || minuteRaw > 59) return null;
+  let hour = hourRaw;
+  const isPm = period === "下午" || period === "晚上" || period === "夜里" || period === "中午";
+  if (isPm && hour < 12) hour += 12;
+  if (period === "凌晨" && hour === 12) hour = 0;
+  const cron = `${minuteRaw} ${hour} * * *`;
+  return { cron, timezoneHint: "Asia/Shanghai" };
+}
+
+function parseCronFromEnglish(text: string): { cron: string; timezoneHint: string } | null {
+  const raw = (text ?? "").toString().trim();
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+  if (!/(every\s+day|daily|each\s+day)/.test(lower)) return null;
+  const patterns: RegExp[] = [
+    /\b(?:every\s+day|daily|each\s+day)\b[\s,]*(?:at\s*)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i,
+    /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b[\s,]*(?:every\s+day|daily|each\s+day)\b/i,
+    /\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b[\s,]*(?:every\s+day|daily|each\s+day)\b/i,
+  ];
+  let m: RegExpExecArray | null = null;
+  for (const re of patterns) {
+    m = re.exec(raw);
+    if (m) break;
+  }
+  if (!m) return null;
+  const hourRaw = Number(m[1]);
+  const minuteRaw = m[2] ? Number(m[2]) : 0;
+  const ampm = (m[3] ?? "").toString().toLowerCase();
+  if (!Number.isFinite(hourRaw) || !Number.isFinite(minuteRaw)) return null;
+  if (minuteRaw < 0 || minuteRaw > 59) return null;
+  let hour = hourRaw;
+  if (ampm) {
+    if (hour < 1 || hour > 12) return null;
+    if (ampm === "am") {
+      if (hour === 12) hour = 0;
+    } else if (ampm === "pm") {
+      if (hour !== 12) hour += 12;
+    } else {
+      return null;
+    }
+  } else {
+    if (hour < 0 || hour > 23) return null;
+  }
+  const cron = `${minuteRaw} ${hour} * * *`;
+  return { cron, timezoneHint: "UTC" };
+}
+
+function inferCronFromMessage(text: string): { cron: string; timezoneHint: string } | null {
+  return parseCronFromChinese(text) || parseCronFromEnglish(text);
+}
+
+function getHeader(headers: Headers, names: string[]) {
+  for (const name of names) {
+    const value = headers.get(name);
+    if (value && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function getClientIp(headers: Headers) {
+  const forwarded = getHeader(headers, ["x-forwarded-for"]);
+  if (forwarded) {
+    const first = forwarded.split(",")[0]?.trim();
+    if (first) return first;
+  }
+  return (
+    getHeader(headers, ["x-real-ip", "cf-connecting-ip", "x-client-ip", "x-forwarded", "forwarded-for", "forwarded"]) || ""
+  );
+}
+
+async function lookupCountryByIp(ip: string) {
+  if (!ip) return null;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 1200);
+  try {
+    const res = await fetch(`https://ipapi.co/${encodeURIComponent(ip)}/json/`, {
+      headers: { Accept: "application/json" },
+      signal: controller.signal,
+    });
+    if (!res.ok) return null;
+    const json = (await res.json()) as { country_code?: string | null };
+    const code = (json?.country_code ?? "").toString().trim().toUpperCase();
+    return code || null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function isValidTimezoneName(value: string) {
+  const s = (value ?? "").toString().trim();
+  if (!s) return false;
+  if (!s.includes("/")) return false;
+  if (/\s/.test(s)) return false;
+  return true;
+}
+
+function inferTimezoneFromCountry(country: string): string | null {
+  const code = (country ?? "").toString().trim().toUpperCase();
+  if (!code) return null;
+  const map: Record<string, string> = {
+    CN: "Asia/Shanghai",
+    HK: "Asia/Hong_Kong",
+    TW: "Asia/Taipei",
+    MO: "Asia/Macau",
+    JP: "Asia/Tokyo",
+    KR: "Asia/Seoul",
+    SG: "Asia/Singapore",
+    IN: "Asia/Kolkata",
+    TH: "Asia/Bangkok",
+    VN: "Asia/Ho_Chi_Minh",
+    ID: "Asia/Jakarta",
+    PH: "Asia/Manila",
+    AU: "Australia/Sydney",
+    NZ: "Pacific/Auckland",
+    GB: "Europe/London",
+    IE: "Europe/Dublin",
+    FR: "Europe/Paris",
+    DE: "Europe/Berlin",
+    ES: "Europe/Madrid",
+    IT: "Europe/Rome",
+    NL: "Europe/Amsterdam",
+    BE: "Europe/Brussels",
+    CH: "Europe/Zurich",
+    AT: "Europe/Vienna",
+    SE: "Europe/Stockholm",
+    NO: "Europe/Oslo",
+    DK: "Europe/Copenhagen",
+    FI: "Europe/Helsinki",
+    PL: "Europe/Warsaw",
+    CZ: "Europe/Prague",
+    PT: "Europe/Lisbon",
+    RU: "Europe/Moscow",
+    TR: "Europe/Istanbul",
+    IL: "Asia/Jerusalem",
+    SA: "Asia/Riyadh",
+    AE: "Asia/Dubai",
+    ZA: "Africa/Johannesburg",
+    NG: "Africa/Lagos",
+    EG: "Africa/Cairo",
+    BR: "America/Sao_Paulo",
+    AR: "America/Argentina/Buenos_Aires",
+    CL: "America/Santiago",
+    CO: "America/Bogota",
+    PE: "America/Lima",
+    MX: "America/Mexico_City",
+    CA: "America/Toronto",
+    US: "America/New_York",
+  };
+  return map[code] || null;
+}
+
+async function inferTimezoneFromRequest(req: Request, fallback: string) {
+  const headers = req.headers;
+  const directTz = getHeader(headers, ["x-vercel-ip-timezone", "cf-timezone", "x-timezone"]);
+  if (directTz && isValidTimezoneName(directTz)) return directTz;
+  const countryHeader =
+    getHeader(headers, ["x-vercel-ip-country"]) || getHeader(headers, ["cf-ipcountry"]) || getHeader(headers, ["x-country-code"]);
+  const country = countryHeader ? countryHeader.toUpperCase() : await lookupCountryByIp(getClientIp(headers));
+  const tz = country ? inferTimezoneFromCountry(country) : null;
+  return tz || fallback;
+}
+
+function inferAutomationKind(message: string): { kind: "ai_news_briefing" | "competitor_monitor" | "other"; target: string } {
+  const raw = (message ?? "").toString().trim();
+  const lower = raw.toLowerCase();
+  if (/早报|新闻|资讯/.test(raw) && (raw.includes("AI") || raw.includes("ai") || /人工智能/.test(raw) || lower.includes("ai "))) {
+    return { kind: "ai_news_briefing", target: "AI新闻早报" };
+  }
+  if (raw.includes("竞品") || raw.includes("竞对") || lower.includes("competitor")) {
+    return { kind: "competitor_monitor", target: raw.slice(0, 80) };
+  }
+  return { kind: "other", target: raw.slice(0, 80) };
+}
+
+async function createAutomationFromBoard(args: {
+  userId: string;
+  origin: string;
+  name: string;
+  cron: string;
+  timezone: string | null;
+  todos: Array<{ text: string; done: boolean }>;
+  internal: Record<string, unknown>;
+  enabled?: boolean;
+  previewConfig?: { enabled: boolean; auto_confirm: boolean; confirm_timeout_seconds: number } | null;
+}) {
+  const now = new Date();
+  const id = crypto.randomUUID();
+  const db = await getMongoDb();
+  await db.collection<AutomationDoc & { internal?: Record<string, unknown> }>("automations").insertOne({
+    _id: id,
+    userId: args.userId,
+    name: args.name,
+    enabled: args.enabled ?? true,
+    cron: args.cron,
+    timezone: args.timezone,
+    webhookUrl: `${args.origin}/api/automations/webhook`,
+    internal: args.internal,
+    previewConfig: args.previewConfig ?? null,
+    todos: args.todos.map((t) => ({ _id: crypto.randomUUID(), text: t.text, done: t.done, createdAt: now })),
+    lastRunAt: null,
+    lastRunOk: null,
+    lastError: null,
+    createdAt: now,
+    updatedAt: now,
+  });
+  await syncAutomationScheduler().catch(() => null);
+  return id;
 }
 
 async function loadChat2EditSystemPrompt(mode: "ask" | "create") {
@@ -1445,8 +1688,78 @@ export async function POST(req: Request): Promise<Response> {
             });
           }
 
+          let replyForClient = result.reply;
+          if (chatMode === "create") {
+            const inferred = inferCronFromMessage(message);
+            const origin = getPublicOrigin(req);
+            if (inferred && origin) {
+              const timezone = await inferTimezoneFromRequest(req, inferred.timezoneHint);
+              const { kind, target } = inferAutomationKind(message);
+              const confirmTimeoutSeconds = 10;
+              const confirmAt = new Date(Date.now() + confirmTimeoutSeconds * 1000).toISOString();
+              const taskPlan =
+                kind === "ai_news_briefing"
+                  ? [
+                      { title: "检索AI新闻源", status: "pending" as const },
+                      { title: "生成要点摘要", status: "pending" as const },
+                      { title: "保存到资源库", status: "pending" as const },
+                    ]
+                  : kind === "competitor_monitor"
+                    ? [
+                        { title: "解析监控目标", status: "pending" as const },
+                        { title: "拉取最新信息", status: "pending" as const },
+                        { title: "生成摘要报告", status: "pending" as const },
+                        { title: "保存到资源库", status: "pending" as const },
+                      ]
+                    : [{ title: "执行自动化任务", status: "pending" as const }];
+
+              const automationName =
+                kind === "ai_news_briefing"
+                  ? "AI新闻早报"
+                  : kind === "competitor_monitor"
+                    ? `竞品监控：${target}`
+                    : `自动化任务：${(message ?? "").toString().slice(0, 24)}`;
+
+              const internal: Record<string, unknown> =
+                kind === "ai_news_briefing"
+                  ? { kind, topic: target, source: "board", model_key: modelId || null }
+                  : kind === "competitor_monitor"
+                    ? { kind, target, source: "board", model_key: modelId || null }
+                    : { kind, target, source: "board", model_key: modelId || null };
+
+              const id = await createAutomationFromBoard({
+                userId: auth.user.id,
+                origin,
+                name: automationName,
+                cron: inferred.cron,
+                timezone: timezone || null,
+                todos: taskPlan.map((t) => ({ text: t.title, done: false })),
+                internal,
+                enabled: false,
+                previewConfig: { enabled: true, auto_confirm: true, confirm_timeout_seconds: confirmTimeoutSeconds },
+              });
+
+              const meta = {
+                task_plan: taskPlan,
+                automation: {
+                  id,
+                  name: automationName,
+                  cron: inferred.cron,
+                  enabled: false,
+                  auto_confirm: true,
+                  confirm_timeout_seconds: confirmTimeoutSeconds,
+                  confirm_at: confirmAt,
+                },
+              };
+
+              const note = "\n\n我将于10秒后按以上配置创建并启用该自动化任务；如需取消或修改，请在倒计时结束前告知我。";
+              if (!replyForClient.includes("10秒后")) replyForClient = `${replyForClient}${note}`;
+              replyForClient = `${replyForClient}${BOARD_MESSAGE_META_DELIMITER}${JSON.stringify(meta)}`;
+            }
+          }
+
           const responsePayload: Chat2EditResponse = {
-            reply: result.reply,
+            reply: replyForClient,
             updated_docs: persisted.map((d) => ({
               id: d.id,
               title: d.title,
@@ -1613,6 +1926,76 @@ export async function POST(req: Request): Promise<Response> {
   const sanitizedReply = sanitizeImageDisclaimers(message, replyWithImageNote);
   const finalResult: SkillResult = { reply: sanitizedReply, updatedDocs: imageAttach.updatedDocs };
 
+  let replyForClient = finalResult.reply;
+  if (chatMode === "create") {
+    const inferred = inferCronFromMessage(message);
+    const origin = getPublicOrigin(req);
+    if (inferred && origin) {
+      const timezone = await inferTimezoneFromRequest(req, inferred.timezoneHint);
+      const { kind, target } = inferAutomationKind(message);
+      const confirmTimeoutSeconds = 10;
+      const confirmAt = new Date(Date.now() + confirmTimeoutSeconds * 1000).toISOString();
+      const taskPlan =
+        kind === "ai_news_briefing"
+          ? [
+              { title: "检索AI新闻源", status: "pending" as const },
+              { title: "生成要点摘要", status: "pending" as const },
+              { title: "保存到资源库", status: "pending" as const },
+            ]
+          : kind === "competitor_monitor"
+            ? [
+                { title: "解析监控目标", status: "pending" as const },
+                { title: "拉取最新信息", status: "pending" as const },
+                { title: "生成摘要报告", status: "pending" as const },
+                { title: "保存到资源库", status: "pending" as const },
+              ]
+            : [{ title: "执行自动化任务", status: "pending" as const }];
+
+      const automationName =
+        kind === "ai_news_briefing"
+          ? "AI新闻早报"
+          : kind === "competitor_monitor"
+            ? `竞品监控：${target}`
+            : `自动化任务：${(message ?? "").toString().slice(0, 24)}`;
+
+      const internal: Record<string, unknown> =
+        kind === "ai_news_briefing"
+          ? { kind, topic: target, source: "board", model_key: modelId || null }
+          : kind === "competitor_monitor"
+            ? { kind, target, source: "board", model_key: modelId || null }
+            : { kind, target, source: "board", model_key: modelId || null };
+
+      const id = await createAutomationFromBoard({
+        userId: auth.user.id,
+        origin,
+        name: automationName,
+        cron: inferred.cron,
+        timezone: timezone || null,
+        todos: taskPlan.map((t) => ({ text: t.title, done: false })),
+        internal,
+        enabled: false,
+        previewConfig: { enabled: true, auto_confirm: true, confirm_timeout_seconds: confirmTimeoutSeconds },
+      });
+
+      const meta = {
+        task_plan: taskPlan,
+        automation: {
+          id,
+          name: automationName,
+          cron: inferred.cron,
+          enabled: false,
+          auto_confirm: true,
+          confirm_timeout_seconds: confirmTimeoutSeconds,
+          confirm_at: confirmAt,
+        },
+      };
+
+      const note = "\n\n我将于10秒后按以上配置创建并启用该自动化任务；如需取消或修改，请在倒计时结束前告知我。";
+      if (!replyForClient.includes("10秒后")) replyForClient = `${replyForClient}${note}`;
+      replyForClient = `${replyForClient}${BOARD_MESSAGE_META_DELIMITER}${JSON.stringify(meta)}`;
+    }
+  }
+
   const docsById = new Map(docs.map((d) => [d.id, d]));
   const normalizeTitle = (t: string | null | undefined) => (t ?? "").toString().trim().toLowerCase();
   const findDocByTitle = (t: string | null | undefined) => {
@@ -1729,7 +2112,7 @@ export async function POST(req: Request): Promise<Response> {
   }
 
   const responsePayload: Chat2EditResponse = {
-    reply: finalResult.reply,
+    reply: replyForClient,
     updated_docs: persisted.map((d) => ({
       id: d.id,
       title: d.title,

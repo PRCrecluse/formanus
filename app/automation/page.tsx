@@ -6,6 +6,7 @@ import { createPortal } from "react-dom";
 import { AlertCircle, CheckCircle2, Loader2, Play, Plus, Settings, Trash2, X } from "lucide-react";
 import { getMembershipStatusWithTimeout, getSessionWithTimeout, isSupabaseConfigured, supabase } from "@/lib/supabaseClient";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { useSearchParams } from "next/navigation";
 
 type TodoItem = {
   id: string;
@@ -256,6 +257,13 @@ function initScheduleDraft(a: Automation): ScheduleDraft {
 }
 
 export default function AutomationPage() {
+  const searchParams = useSearchParams();
+  const focusAutomationId = useMemo(() => {
+    const id = searchParams.get("id");
+    const trimmed = (id ?? "").toString().trim();
+    return trimmed ? trimmed : null;
+  }, [searchParams]);
+
   const [loading, setLoading] = useState(true);
   const [savingId, setSavingId] = useState<string | null>(null);
   const [runningId, setRunningId] = useState<string | null>(null);
@@ -335,6 +343,19 @@ export default function AutomationPage() {
   useEffect(() => {
     void loadAutomations();
   }, [loadAutomations]);
+
+  useEffect(() => {
+    if (loading) return;
+    if (!focusAutomationId) return;
+    if (typeof document === "undefined") return;
+    const t = window.setTimeout(() => {
+      const el = document.getElementById(`automation-${focusAutomationId}`);
+      if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 0);
+    return () => {
+      window.clearTimeout(t);
+    };
+  }, [focusAutomationId, loading, automations.length]);
 
   useEffect(() => {
     let cancelled = false;
@@ -754,10 +775,16 @@ export default function AutomationPage() {
             const displayIndex = index + 1;
             const blocks = blocksByAutomation[a.id] ?? createDefaultBlocks();
             const addBlockValue = pendingAddKindByAutomation[a.id] ?? "";
+            const focused = focusAutomationId === a.id;
             return (
               <div
                 key={a.id}
-                className="rounded-3xl border border-zinc-200 bg-white p-5 shadow-sm dark:border-zinc-800 dark:bg-zinc-950"
+                id={`automation-${a.id}`}
+                className={`rounded-3xl border bg-white p-5 shadow-sm dark:bg-zinc-950 ${
+                  focused
+                    ? "border-blue-300 ring-2 ring-blue-200 dark:border-blue-700 dark:ring-blue-900/40"
+                    : "border-zinc-200 dark:border-zinc-800"
+                }`}
               >
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="flex min-w-0 flex-1 items-center gap-3">

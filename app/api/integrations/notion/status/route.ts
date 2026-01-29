@@ -87,6 +87,14 @@ async function notionRequest<T>({
   return { ok: res.ok, status: res.status, json, text, retryAfterMs };
 }
 
+function cleanUrl(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const unwrapped = trimmed.replace(/^`+/, "").replace(/`+$/, "").trim();
+  return unwrapped || null;
+}
+
 async function notionRequestWithRetry<T>(
   args: NotionRequestArgs,
   opts?: { attempts?: number; minBackoffMs?: number; maxBackoffMs?: number }
@@ -202,6 +210,9 @@ export async function GET(req: Request) {
           botId?: unknown;
           botName?: unknown;
           botAvatarUrl?: unknown;
+          userId?: unknown;
+          userName?: unknown;
+          userAvatarUrl?: unknown;
           syncToEnabled?: unknown;
           importEnabled?: unknown;
           parentPageId?: unknown;
@@ -215,6 +226,39 @@ export async function GET(req: Request) {
     })();
     let botAvatarUrl = typeof profile?.botAvatarUrl === "string" ? profile.botAvatarUrl : null;
     let botName = typeof profile?.botName === "string" ? profile.botName : null;
+    const userId = typeof profile?.userId === "string" ? profile.userId : null;
+    let userName = typeof profile?.userName === "string" ? profile.userName : null;
+    let userAvatarUrl = typeof profile?.userAvatarUrl === "string" ? profile.userAvatarUrl : null;
+
+    const profileUpdates: Record<string, unknown> = {};
+
+    if ((userId && (!userAvatarUrl || !userName)) && accessToken) {
+      stage = "notion_user";
+      const userRes = await withTimeout(
+        notionRequestWithRetry<Record<string, unknown>>({
+          token: accessToken,
+          method: "GET",
+          path: `/users/${encodeURIComponent(userId)}`,
+        }),
+        8_000,
+        "notion_user_timeout"
+      );
+      const fetchedAvatarUrl = userRes.json ? cleanUrl(userRes.json.avatar_url) : null;
+      const fetchedName = userRes.json && typeof userRes.json.name === "string" ? (userRes.json.name as string) : null;
+      userAvatarUrl = userAvatarUrl ?? fetchedAvatarUrl;
+      userName = userName ?? fetchedName;
+      if (fetchedAvatarUrl) profileUpdates["profile.userAvatarUrl"] = fetchedAvatarUrl;
+      if (fetchedName) profileUpdates["profile.userName"] = fetchedName;
+      if (debugEnabled) {
+        console.log("[integrations:notion:status] user", {
+          requestId,
+          ok: userRes.ok,
+          status: userRes.status,
+          hasAvatarUrl: Boolean(fetchedAvatarUrl),
+          hasName: Boolean(fetchedName),
+        });
+      }
+    }
 
     if ((!botAvatarUrl || !botName) && accessToken) {
       stage = "notion_me";
@@ -227,10 +271,12 @@ export async function GET(req: Request) {
         8_000,
         "notion_me_timeout"
       );
-      const fetchedAvatarUrl = meRes.json && typeof meRes.json.avatar_url === "string" ? (meRes.json.avatar_url as string) : null;
+      const fetchedAvatarUrl = meRes.json ? cleanUrl(meRes.json.avatar_url) : null;
       const fetchedName = meRes.json && typeof meRes.json.name === "string" ? (meRes.json.name as string) : null;
       botAvatarUrl = botAvatarUrl ?? fetchedAvatarUrl;
       botName = botName ?? fetchedName;
+      if (fetchedAvatarUrl) profileUpdates["profile.botAvatarUrl"] = fetchedAvatarUrl;
+      if (fetchedName) profileUpdates["profile.botName"] = fetchedName;
       if (debugEnabled) {
         console.log("[integrations:notion:status] me", {
           requestId,
@@ -243,17 +289,18 @@ export async function GET(req: Request) {
           console.log("[integrations:notion:status] me_body", { requestId, body: meRes.text ? meRes.text.slice(0, 500) : "" });
         }
       }
-      if (meRes.ok && (fetchedAvatarUrl || fetchedName)) {
-        stage = "db_update_profile";
-        await withTimeout(
-          col.updateOne(
-            { userId: auth.user.id, provider: "notion" },
-            { $set: { "profile.botAvatarUrl": fetchedAvatarUrl, "profile.botName": fetchedName, updatedAt: new Date() } }
-          ),
-          10_000,
-          "db_update_timeout"
-        );
-      }
+    }
+
+    if (Object.keys(profileUpdates).length > 0) {
+      stage = "db_update_profile";
+      await withTimeout(
+        col.updateOne(
+          { userId: auth.user.id, provider: "notion" },
+          { $set: { ...profileUpdates, updatedAt: new Date() } }
+        ),
+        10_000,
+        "db_update_timeout"
+      );
     }
     return NextResponse.json(
       {
@@ -264,6 +311,9 @@ export async function GET(req: Request) {
         botId: typeof profile?.botId === "string" ? profile.botId : null,
         botName,
         botAvatarUrl,
+        userId,
+        userName,
+        userAvatarUrl,
         syncToEnabled: Boolean(profile?.syncToEnabled),
         importEnabled: Boolean(profile?.importEnabled),
         parentPageId: typeof profile?.parentPageId === "string" ? profile.parentPageId : null,

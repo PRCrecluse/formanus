@@ -14,8 +14,9 @@ import {
   AIInputFileUploadButton,
   AIInputVoiceButton,
 } from "@/components/ui/ai-input";
-import { Plus, Mic, FileText, Images, Image, PenLine, Folder, X, Users, ChevronUp, ChevronDown, RefreshCw } from "lucide-react";
+import { Plus, Mic, FileText, Images, Image, PenLine, Folder, X, Users, ChevronUp, ChevronDown, RefreshCw, CheckSquare } from "lucide-react";
 import { useParams, useRouter } from "next/navigation";
+import Link from "next/link";
 import { getSessionWithTimeout, supabase } from "@/lib/supabaseClient";
 import { getCleanPersonaDocId, makePersonaDocDbId, normalizePersonaDocType } from "@/lib/utils";
 
@@ -134,6 +135,16 @@ type BoardAssistantDeliveryDoc = {
 type BoardAssistantMeta = {
   updated_docs?: BoardAssistantDeliveryDoc[];
   thinking_steps?: { label: string }[];
+  task_plan?: { title: string; status?: "pending" | "in_progress" | "completed" }[];
+  automation?: {
+    id: string;
+    name: string;
+    cron: string;
+    enabled: boolean;
+    auto_confirm?: boolean;
+    confirm_timeout_seconds?: number;
+    confirm_at?: string | null;
+  };
 };
 
 const BOARD_MESSAGE_META_DELIMITER = "\n---AIPERSONA_META---\n";
@@ -181,9 +192,52 @@ function parseBoardMessageContent(raw: string): { text: string; meta: BoardAssis
         })
         .filter((x): x is { label: string } => Boolean(x))
     : [];
+  const taskPlanRaw = (parsed as { task_plan?: unknown }).task_plan;
+  const taskPlan = Array.isArray(taskPlanRaw)
+    ? taskPlanRaw
+        .map((t) => {
+          const obj = t && typeof t === "object" ? (t as Record<string, unknown>) : null;
+          const title = typeof obj?.title === "string" ? obj.title.trim() : "";
+          if (!title) return null;
+          const statusRaw = typeof obj?.status === "string" ? obj.status.trim() : "";
+          const status =
+            statusRaw === "pending" || statusRaw === "in_progress" || statusRaw === "completed"
+              ? (statusRaw as "pending" | "in_progress" | "completed")
+              : undefined;
+          return { title, ...(status ? { status } : {}) } as { title: string; status?: "pending" | "in_progress" | "completed" };
+        })
+        .filter((x): x is { title: string; status?: "pending" | "in_progress" | "completed" } => Boolean(x))
+    : [];
+  const automationRaw = (parsed as { automation?: unknown }).automation;
+  const automationObj = automationRaw && typeof automationRaw === "object" ? (automationRaw as Record<string, unknown>) : null;
+  const automation = (() => {
+    if (!automationObj) return null;
+    const id = typeof automationObj.id === "string" ? automationObj.id.trim() : "";
+    if (!id) return null;
+    const name = typeof automationObj.name === "string" ? automationObj.name.trim() : "";
+    const cron = typeof automationObj.cron === "string" ? automationObj.cron.trim() : "";
+    const enabled = Boolean(automationObj.enabled);
+    const autoConfirm = Boolean(automationObj.auto_confirm);
+    const confirmTimeoutSeconds =
+      typeof automationObj.confirm_timeout_seconds === "number" && Number.isFinite(automationObj.confirm_timeout_seconds)
+        ? automationObj.confirm_timeout_seconds
+        : 10;
+    const confirmAt = typeof automationObj.confirm_at === "string" ? automationObj.confirm_at : null;
+    return {
+      id,
+      name,
+      cron,
+      enabled,
+      auto_confirm: autoConfirm,
+      confirm_timeout_seconds: confirmTimeoutSeconds,
+      confirm_at: confirmAt,
+    } satisfies NonNullable<BoardAssistantMeta["automation"]>;
+  })();
   const meta: BoardAssistantMeta = {};
   if (docs.length > 0) meta.updated_docs = docs;
   if (steps.length > 0) meta.thinking_steps = steps;
+  if (taskPlan.length > 0) meta.task_plan = taskPlan;
+  if (automation) meta.automation = automation;
   return { text, meta: Object.keys(meta).length > 0 ? meta : null };
 }
 
@@ -200,12 +254,29 @@ const ChatMessageItem = memo(function ChatMessageItem({
   showRetry,
   onRetry,
   disabled,
+  pendingAutomationConfirm,
+  autoConfirmNow,
+  onEnableAutomation,
+  onCancelAutomation,
 }: {
   msg: Message;
   showRetry: boolean;
   onRetry: () => void;
   disabled: boolean;
+  pendingAutomationConfirm: { id: string; confirmAt: string | null; timeoutSeconds: number } | null;
+  autoConfirmNow: number;
+  onEnableAutomation: (automationId: string) => void;
+  onCancelAutomation: (automationId: string) => void;
 }) {
+  const a = msg.meta?.automation ?? null;
+  const showAutoConfirm = Boolean(a?.auto_confirm) && Boolean(a?.id) && !Boolean(a?.enabled) && pendingAutomationConfirm?.id === a?.id;
+  const secondsLeft = (() => {
+    if (!showAutoConfirm) return null;
+    const confirmAtMs = a?.confirm_at ? Date.parse(a.confirm_at) : NaN;
+    if (Number.isFinite(confirmAtMs)) return Math.max(0, Math.ceil((confirmAtMs - autoConfirmNow) / 1000));
+    const fallback = typeof a?.confirm_timeout_seconds === "number" ? a.confirm_timeout_seconds : 10;
+    return Math.max(0, fallback);
+  })();
   return (
     <div className={`flex flex-col gap-2 ${msg.role === "user" ? "items-end" : "items-start"}`}>
       <div className="text-xs text-zinc-500">{msg.role === "user" ? "You" : "AI"}</div>
@@ -247,6 +318,59 @@ const ChatMessageItem = memo(function ChatMessageItem({
               <span className="max-w-[220px] truncate">{(doc.title ?? "").toString().trim() || "交付文档"}</span>
             </div>
           ))}
+        </div>
+      )}
+      {msg.role === "assistant" && msg.meta?.task_plan && msg.meta.task_plan.length > 0 && (
+        <div className="mt-1 w-full max-w-[80%] rounded-lg border border-zinc-200 bg-white px-3 py-2 text-[11px] text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100">
+          <div className="text-[11px] font-semibold">任务清单</div>
+          <div className="mt-1 flex flex-col gap-1">
+            {msg.meta.task_plan.map((t, idx) => (
+              <div key={`${msg.id}-plan-${idx}`} className="flex items-center justify-between gap-2">
+                <div className="min-w-0 truncate">{t.title}</div>
+                <div className="shrink-0 text-[10px] text-zinc-500 dark:text-zinc-400">
+                  {t.status === "completed" ? "完成" : t.status === "in_progress" ? "进行中" : "待办"}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {msg.role === "assistant" && a && a.id && (
+        <div className="mt-1 w-full max-w-[80%] rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-[11px] text-amber-900 dark:border-amber-500/60 dark:bg-amber-900/30 dark:text-amber-50">
+          <div className="flex items-start justify-between gap-2">
+            <div className="min-w-0">
+              <div className="text-[11px] font-semibold">自动化任务预览：{a.name || "未命名自动化"}</div>
+              <div className="mt-0.5 text-[10px] text-amber-800/80 dark:text-amber-100/80">
+                调度：{a.cron || "（未提供）"} · 当前状态：{a.enabled ? "已启用" : "待确认"}
+              </div>
+            </div>
+            <Link href={`/automation?id=${encodeURIComponent(a.id)}`} className="shrink-0 text-blue-600 underline">
+              View
+            </Link>
+          </div>
+          {showAutoConfirm && (
+            <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px]">
+              <div className="mr-auto">
+                将在 {secondsLeft ?? 10}s 后自动启用；如需取消或修改，请在倒计时结束前操作。
+              </div>
+              <button
+                type="button"
+                disabled={disabled}
+                onClick={() => onEnableAutomation(a.id)}
+                className="rounded-md border border-amber-300 bg-white px-2 py-1 text-amber-900 hover:bg-amber-100 disabled:opacity-50 dark:border-amber-500/60 dark:bg-amber-950/20 dark:text-amber-50 dark:hover:bg-amber-950/35"
+              >
+                立即启用
+              </button>
+              <button
+                type="button"
+                disabled={disabled}
+                onClick={() => onCancelAutomation(a.id)}
+                className="rounded-md border border-amber-300 bg-white px-2 py-1 text-amber-900 hover:bg-amber-100 disabled:opacity-50 dark:border-amber-500/60 dark:bg-amber-950/20 dark:text-amber-50 dark:hover:bg-amber-950/35"
+              >
+                取消
+              </button>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -361,6 +485,17 @@ export default function ChatPage() {
   const [message, setMessage] = useState("");
   const [chatSending, setChatSending] = useState(false);
   const messagesRef = useRef<Message[]>([]);
+  const [pendingAutomationConfirm, setPendingAutomationConfirm] = useState<{
+    id: string;
+    confirmAt: string | null;
+    timeoutSeconds: number;
+  } | null>(null);
+  const pendingAutomationConfirmRef = useRef<{
+    id: string;
+    confirmAt: string | null;
+    timeoutSeconds: number;
+  } | null>(null);
+  const [autoConfirmNow, setAutoConfirmNow] = useState(() => Date.now());
   const [hoverTip, setHoverTip] = useState<{ x: number; y: number; visible: boolean; text: string }>({
     x: 0,
     y: 0,
@@ -377,6 +512,14 @@ export default function ChatPage() {
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+  useEffect(() => {
+    pendingAutomationConfirmRef.current = pendingAutomationConfirm;
+  }, [pendingAutomationConfirm]);
+  useEffect(() => {
+    if (!pendingAutomationConfirm) return;
+    const t = window.setInterval(() => setAutoConfirmNow(Date.now()), 300);
+    return () => window.clearInterval(t);
+  }, [pendingAutomationConfirm]);
 
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
   const [attachedResourceIds, setAttachedResourceIds] = useState<string[]>([]);
@@ -391,6 +534,75 @@ export default function ChatPage() {
   const chatAbortControllerRef = useRef<AbortController | null>(null);
   const stopAllRef = useRef(false);
   const historyLoadReqIdRef = useRef(0);
+
+  const enableAutomation = useCallback(async (automationId: string) => {
+    const sessionInfo = await getSessionWithTimeout({ timeoutMs: 4500, retries: 2, retryDelayMs: 200 });
+    const token = sessionInfo.session?.access_token ?? "";
+    if (!token) return;
+    await fetch(`/api/automations/${encodeURIComponent(automationId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ enabled: true }),
+    }).catch(() => null);
+    setMessages((prev) =>
+      prev.map((m) => {
+        const a = m.meta?.automation;
+        if (!a || a.id !== automationId) return m;
+        return { ...m, meta: { ...(m.meta ?? {}), automation: { ...a, enabled: true, auto_confirm: false } } };
+      })
+    );
+  }, []);
+
+  const cancelAutomation = useCallback(async (automationId: string) => {
+    const sessionInfo = await getSessionWithTimeout({ timeoutMs: 4500, retries: 2, retryDelayMs: 200 });
+    const token = sessionInfo.session?.access_token ?? "";
+    if (!token) return;
+    await fetch(`/api/automations/${encodeURIComponent(automationId)}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${token}` },
+    }).catch(() => null);
+    setMessages((prev) =>
+      prev.map((m) => {
+        const a = m.meta?.automation;
+        if (!a || a.id !== automationId) return m;
+        return { ...m, meta: { ...(m.meta ?? {}), automation: { ...a, enabled: false, auto_confirm: false } } };
+      })
+    );
+  }, []);
+
+  useEffect(() => {
+    const last = [...messages]
+      .reverse()
+      .find((m) => m.role === "assistant" && m.meta?.automation && m.meta.automation.auto_confirm && !m.meta.automation.enabled);
+    if (!last?.meta?.automation?.id) {
+      if (pendingAutomationConfirmRef.current) setPendingAutomationConfirm(null);
+      return;
+    }
+    const a = last.meta.automation;
+    const next = {
+      id: a.id,
+      confirmAt: a.confirm_at ?? null,
+      timeoutSeconds: a.confirm_timeout_seconds ?? 10,
+    };
+    const current = pendingAutomationConfirmRef.current;
+    if (current && current.id === next.id && current.confirmAt === next.confirmAt && current.timeoutSeconds === next.timeoutSeconds) return;
+    setPendingAutomationConfirm(next);
+  }, [messages]);
+
+  useEffect(() => {
+    if (!pendingAutomationConfirm) return;
+    const confirmAtMs = pendingAutomationConfirm.confirmAt ? Date.parse(pendingAutomationConfirm.confirmAt) : NaN;
+    const delayMs = Number.isFinite(confirmAtMs)
+      ? Math.max(0, confirmAtMs - Date.now())
+      : Math.max(0, pendingAutomationConfirm.timeoutSeconds * 1000);
+    const t = window.setTimeout(() => {
+      const current = pendingAutomationConfirmRef.current;
+      if (!current || current.id !== pendingAutomationConfirm.id) return;
+      void enableAutomation(pendingAutomationConfirm.id);
+      setPendingAutomationConfirm(null);
+    }, delayMs);
+    return () => window.clearTimeout(t);
+  }, [enableAutomation, pendingAutomationConfirm]);
 
   const enabledModels = useMemo(() => {
     const allowed = new Set(enabledModelIds);
@@ -1112,6 +1324,7 @@ export default function ChatPage() {
           abortController.abort();
         }, ms);
       };
+      let planningMessageId: string | null = null;
       try {
       let currentUserId = userId;
       if (!currentUserId) {
@@ -1157,9 +1370,23 @@ export default function ChatPage() {
       }
 
       const optimisticMessageId = `local-${crypto.randomUUID()}`;
+      planningMessageId = `local-plan-${crypto.randomUUID()}`;
       setMessages((prev) => [
         ...prev,
         { id: optimisticMessageId, role: "user", content: finalContent, created_at: new Date().toISOString(), meta: null },
+        {
+          id: planningMessageId!,
+          role: "assistant",
+          content: "正在规划任务…",
+          created_at: new Date().toISOString(),
+          meta: {
+            task_plan: [
+              { title: "理解需求与约束", status: "in_progress" },
+              { title: "制定执行步骤", status: "pending" },
+              { title: "执行并反馈结果", status: "pending" },
+            ],
+          },
+        },
       ]);
 
       setPendingFiles([]);
@@ -1179,7 +1406,7 @@ export default function ChatPage() {
 
       if (msgError || !savedUser) {
         console.error("Error sending message:", msgError);
-        setMessages((prev) => prev.filter((m) => m.id !== optimisticMessageId));
+        setMessages((prev) => prev.filter((m) => m.id !== optimisticMessageId && m.id !== planningMessageId));
         return;
       }
 
@@ -1259,7 +1486,7 @@ export default function ChatPage() {
           .select("id,role,content,created_at")
           .single();
         if (savedAssistant) {
-          setMessages((prev) => [...prev, parseMessageRow(savedAssistant)]);
+          setMessages((prev) => [...prev.filter((m) => m.id !== planningMessageId), parseMessageRow(savedAssistant)]);
         }
         setQuickAction(null);
       } else if (isDesignImage) {
@@ -1302,7 +1529,7 @@ export default function ChatPage() {
           .select("id,role,content,created_at")
           .single();
         if (savedAssistant) {
-          setMessages((prev) => [...prev, parseMessageRow(savedAssistant)]);
+          setMessages((prev) => [...prev.filter((m) => m.id !== planningMessageId), parseMessageRow(savedAssistant)]);
         }
         setQuickAction(null);
       } else if (isXhsBatch) {
@@ -1482,7 +1709,7 @@ export default function ChatPage() {
           .select("id,role,content,created_at")
           .single();
         if (savedAssistant) {
-          setMessages((prev) => [...prev, parseMessageRow(savedAssistant)]);
+          setMessages((prev) => [...prev.filter((m) => m.id !== planningMessageId), parseMessageRow(savedAssistant)]);
         }
         setQuickAction(null);
       } else {
@@ -1519,7 +1746,18 @@ export default function ChatPage() {
             .select("id,role,content,created_at")
             .single();
           if (savedAssistant) {
-            setMessages((prev) => [...prev, parseMessageRow(savedAssistant)]);
+            const parsedMsg = parseMessageRow(savedAssistant);
+            setMessages((prev) => [...prev.filter((m) => m.id !== planningMessageId), parsedMsg]);
+            const a = parsedMsg.meta?.automation ?? null;
+            if (a && a.id && a.auto_confirm && !a.enabled) {
+              setPendingAutomationConfirm({
+                id: a.id,
+                confirmAt: a.confirm_at ?? null,
+                timeoutSeconds: a.confirm_timeout_seconds ?? 10,
+              });
+            } else {
+              setPendingAutomationConfirm(null);
+            }
           }
         }
       }
@@ -1540,7 +1778,7 @@ export default function ChatPage() {
               .select("id,role,content,created_at")
               .single();
             if (savedTimeout) {
-              setMessages((prev) => [...prev, parseMessageRow(savedTimeout)]);
+              setMessages((prev) => [...prev.filter((m) => m.id !== planningMessageId), parseMessageRow(savedTimeout)]);
             }
           }
         } else {
@@ -1569,7 +1807,7 @@ export default function ChatPage() {
               .select("id,role,content,created_at")
               .single();
             if (savedErr) {
-              setMessages((prev) => [...prev, parseMessageRow(savedErr)]);
+              setMessages((prev) => [...prev.filter((m) => m.id !== planningMessageId), parseMessageRow(savedErr)]);
             }
           }
         }
@@ -1579,6 +1817,9 @@ export default function ChatPage() {
         router.push(`/chat/${currentChatId}`);
       }
     } finally {
+      if (planningMessageId) {
+        setMessages((prev) => prev.filter((m) => m.id !== planningMessageId));
+      }
       if (chatAbortControllerRef.current === abortController) {
         chatAbortControllerRef.current = null;
       }
@@ -1617,6 +1858,16 @@ export default function ChatPage() {
     return null;
   }, [messages]);
 
+  const latestTaskPlan = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const m = messages[i];
+      if (!m || m.role !== "assistant") continue;
+      const plan = m.meta?.task_plan;
+      if (plan && plan.length > 0) return plan;
+    }
+    return null;
+  }, [messages]);
+
   const handleRetryLast = useCallback(() => {
     if (chatSending) return;
     const list = messagesRef.current;
@@ -1651,6 +1902,25 @@ export default function ChatPage() {
 
   const renderChatInput = (opts: { showQuickActions: boolean }) => (
     <div>
+      {latestTaskPlan && latestTaskPlan.length > 0 && (
+        <div className="mb-2 rounded-2xl border border-zinc-200 bg-white px-3 py-2 text-[11px] text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100">
+          <div className="text-[11px] font-semibold">任务规划</div>
+          <div className="mt-1 flex flex-col gap-1.5">
+            {latestTaskPlan.map((t, idx) => (
+              <div key={`plan-panel-${idx}`} className="flex items-center gap-2">
+                {t.status === "completed" ? (
+                  <CheckSquare className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+                ) : t.status === "in_progress" ? (
+                  <RefreshCw className="h-4 w-4 animate-spin text-zinc-600 dark:text-zinc-300" />
+                ) : (
+                  <span className="h-4 w-4 rounded border border-zinc-300 bg-white dark:border-zinc-700 dark:bg-zinc-950" />
+                )}
+                <div className="min-w-0 flex-1 truncate">{t.title}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       {(pendingFiles.length > 0 || attachedResourceIds.length > 0 || attachedPathRefs.length > 0) && (
         <div className="mb-2 rounded-t-2xl border border-b-0 border-zinc-200 bg-white px-3 py-1 text-xs text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900">
           <div className="flex items-center justify-between gap-3">
@@ -2002,6 +2272,16 @@ export default function ChatPage() {
                   showRetry={msg.role === "assistant" && msg.id === lastAssistantMessageId}
                   onRetry={handleRetryLast}
                   disabled={chatSending}
+                  pendingAutomationConfirm={pendingAutomationConfirm}
+                  autoConfirmNow={autoConfirmNow}
+                  onEnableAutomation={(id) => {
+                    setPendingAutomationConfirm(null);
+                    void enableAutomation(id);
+                  }}
+                  onCancelAutomation={(id) => {
+                    setPendingAutomationConfirm(null);
+                    void cancelAutomation(id);
+                  }}
                 />
               ))}
               {chatSending && (
