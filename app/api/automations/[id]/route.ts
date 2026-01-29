@@ -1,6 +1,6 @@
 import { getMongoDb } from "@/lib/mongodb";
 import { getUserFromRequest } from "@/lib/supabaseAuthServer";
-import { syncAutomationScheduler, type AutomationDoc } from "@/lib/automationScheduler";
+import { removeAutomationJob, syncAutomationScheduler, type AutomationDoc } from "@/lib/automationScheduler";
 
 export const runtime = "nodejs";
 
@@ -94,7 +94,7 @@ export async function PATCH(req: Request, context: { params: Promise<{ id: strin
   const next = await db.collection<AutomationDoc>("automations").findOne({ _id: id, userId: auth.user.id });
   if (!next) return Response.json({ error: "Not found" }, { status: 404 });
 
-  await syncAutomationScheduler().catch(() => null);
+  void syncAutomationScheduler().catch(() => null);
 
   return Response.json(toApi(next));
 }
@@ -109,8 +109,8 @@ export async function DELETE(_req: Request, context: { params: Promise<{ id: str
   const db = await getMongoDb();
   await db.collection<AutomationDoc>("automations").deleteOne({ _id: id, userId: auth.user.id });
 
-  await syncAutomationScheduler().catch(() => null);
+  removeAutomationJob(id);
+  void syncAutomationScheduler().catch(() => null);
 
   return Response.json({ ok: true });
 }
-

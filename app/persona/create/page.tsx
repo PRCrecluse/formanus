@@ -12,6 +12,8 @@ import { invokeEdgeFunction, isSupabaseConfigured, supabase } from "@/lib/supaba
 type Step = 1 | 2 | 3;
 type IpField = "name" | "description" | "purpose";
 type IpFormData = { name: string; description: string; purpose: string };
+type IpSetupMode = "existing" | "new";
+type IpSourcePlatform = "twitter" | "wechat";
 
 type OssPromptConfig = {
   system: string;
@@ -105,6 +107,100 @@ async function fetchGptOssSuggestion(args: { field: IpField; text: string; conte
   return { suggestion, status: suggestion ? ("ok" as const) : ("idle" as const) };
 }
 
+function extractJsonObjectFromText(text: string): Record<string, unknown> | null {
+  const raw = (text ?? "").toString();
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start < 0 || end < 0 || end <= start) return null;
+  const slice = raw.slice(start, end + 1);
+  try {
+    const parsed = JSON.parse(slice) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchGptOssIpAutofill(args: {
+  platform: IpSourcePlatform;
+  account: string;
+  searchResults: Array<{ title?: string; url?: string; snippet?: string }>;
+}) {
+  const cfg = await loadOssPromptConfig();
+  const baseUrl =
+    cfg?.baseUrl ||
+    process.env.NEXT_PUBLIC_GPT_OSS_CHAT_COMPLETIONS_URL ||
+    process.env.NEXT_PUBLIC_OPENROUTER_BASE_URL ||
+    "https://openrouter.ai/api/v1/chat/completions";
+
+  const model = cfg?.model || process.env.NEXT_PUBLIC_GPT_OSS_MODEL || "openai/gpt-oss-20b";
+  const apiKey = process.env.NEXT_PUBLIC_GPT_OSS_API_KEY || process.env.NEXT_PUBLIC_OPENROUTER_API_KEY || "";
+
+  const needsKey = baseUrl.includes("openrouter.ai");
+  if (needsKey && !apiKey) {
+    return { data: null as IpFormData | null, status: "disabled" as const, reason: "missing NEXT_PUBLIC_OPENROUTER_API_KEY" };
+  }
+
+  const system =
+    cfg?.system ||
+    [
+      "You help fill out a 'personal brand / IP' form from public info.",
+      "Use the provided platform/account hint and web search results.",
+      "Return ONLY valid JSON with keys: name, description, purpose.",
+      "Keep description and purpose concise (1-2 sentences each).",
+      "If uncertain, make a best-effort guess rather than leaving empty.",
+    ].join("\n");
+
+  const user = JSON.stringify({
+    platform: args.platform,
+    account: args.account,
+    search_results: (args.searchResults ?? []).slice(0, 6).map((r) => ({
+      title: (r.title ?? "").toString().trim(),
+      url: (r.url ?? "").toString().trim(),
+      snippet: (r.snippet ?? "").toString().trim(),
+    })),
+  });
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+  if (needsKey) {
+    headers["HTTP-Referer"] = "https://aipersona.web";
+    headers["X-Title"] = "AIPersona";
+  }
+
+  const response = await fetch(baseUrl, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      max_tokens: 300,
+      stream: false,
+    }),
+  });
+
+  if (!response.ok) {
+    return { data: null as IpFormData | null, status: "error" as const, reason: `http ${response.status}` };
+  }
+
+  const result = await response.json();
+  const content = (result?.choices?.[0]?.message?.content ?? "").toString();
+  const obj = extractJsonObjectFromText(content);
+  if (!obj) return { data: null as IpFormData | null, status: "error" as const, reason: "invalid json" };
+
+  const name = typeof obj.name === "string" ? obj.name.trim() : "";
+  const description = typeof obj.description === "string" ? obj.description.trim() : "";
+  const purpose = typeof obj.purpose === "string" ? obj.purpose.trim() : "";
+
+  return { data: { name, description, purpose }, status: "ok" as const };
+}
+
 export default function CreatePersonaPage() {
   const router = useRouter();
   const [step, setStep] = useState<Step>(1);
@@ -136,6 +232,12 @@ export default function CreatePersonaPage() {
     name: "",
     description: "",
     purpose: "",
+  });
+  const [ipSetupMode, setIpSetupMode] = useState<IpSetupMode | null>(null);
+  const [ipSourcePlatform, setIpSourcePlatform] = useState<IpSourcePlatform>("twitter");
+  const [ipSourceAccount, setIpSourceAccount] = useState("");
+  const [ipRetrieveUi, setIpRetrieveUi] = useState<{ status: "idle" | "loading" | "ok" | "disabled" | "error"; message?: string }>({
+    status: "idle",
   });
 
   const [ipFocusedField, setIpFocusedField] = useState<IpField | null>(null);
@@ -241,6 +343,14 @@ export default function CreatePersonaPage() {
   }, [creationStatus]);
 
   useEffect(() => {
+    if (creationType === "ip") return;
+    setIpSetupMode(null);
+    setIpSourcePlatform("twitter");
+    setIpSourceAccount("");
+    setIpRetrieveUi({ status: "idle" });
+  }, [creationType]);
+
+  useEffect(() => {
     if (creationType !== "ip") return;
     if (!ipFocusedField) return;
 
@@ -296,6 +406,82 @@ export default function CreatePersonaPage() {
         : `${current}${suggestion}`;
     setIpFormData((prev) => ({ ...prev, [field]: next }));
     setIpSuggestion((prev) => ({ ...prev, [field]: "" }));
+  };
+
+  const handleRetrieveIpFromAccount = async () => {
+    const account = ipSourceAccount.trim();
+    if (!account) {
+      setIpRetrieveUi({ status: "error", message: "Please enter your account." });
+      return;
+    }
+
+    if (!isSupabaseConfigured) {
+      setIpRetrieveUi({ status: "error", message: "Supabase not configured." });
+      return;
+    }
+
+    setIpRetrieveUi({ status: "loading" });
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const token = session?.access_token ?? null;
+      if (!token) {
+        setIpRetrieveUi({ status: "error", message: "Please log in first." });
+        return;
+      }
+
+      const normalized = account.replace(/^@+/, "").trim();
+      const query =
+        ipSourcePlatform === "twitter"
+          ? normalized.includes("twitter.com")
+            ? `X (Twitter) profile ${normalized}`
+            : `site:twitter.com ${normalized}`
+          : `微信公众号 ${normalized}`;
+
+      const res = await fetch("/api/skills/run", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          id: "search-query",
+          input: { query, limit: 5 },
+        }),
+      });
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(text || `Search failed (${res.status})`);
+      }
+
+      const json = (await res.json()) as { output?: unknown };
+      const output = json?.output as { results?: unknown } | null;
+      const results = Array.isArray(output?.results) ? (output!.results as Array<{ title?: string; url?: string; snippet?: string }>) : [];
+
+      const ai = await fetchGptOssIpAutofill({ platform: ipSourcePlatform, account, searchResults: results });
+      if (ai.status === "disabled") {
+        setIpRetrieveUi({ status: "disabled", message: "AI disabled (missing NEXT_PUBLIC_OPENROUTER_API_KEY)" });
+        return;
+      }
+      if (ai.status !== "ok" || !ai.data) {
+        setIpRetrieveUi({ status: "error", message: `AI error (${ai.reason ?? "invoke failed"})` });
+        return;
+      }
+
+      setIpFormData({
+        name: ai.data.name || normalized || "My IP",
+        description: ai.data.description,
+        purpose: ai.data.purpose,
+      });
+      setIpSuggestion({ name: "", description: "", purpose: "" });
+      setIpFocusedField(null);
+      setIpRetrieveUi({ status: "ok", message: "Filled from your account." });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Retrieve failed";
+      setIpRetrieveUi({ status: "error", message: msg });
+    }
   };
 
   const handleCreate = async () => {
@@ -493,8 +679,108 @@ export default function CreatePersonaPage() {
           </div>
         ) : creationType === 'ip' ? (
             <div className="animate-in fade-in slide-in-from-right-4 duration-300">
-                <h2 className="mb-6 text-xl font-bold">IP Information</h2>
-                <div className="space-y-6">
+                <div className="mb-6 flex items-center justify-between gap-4">
+                  <h2 className="text-xl font-bold">IP Information</h2>
+                  {ipSetupMode && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIpSetupMode(null);
+                        setIpRetrieveUi({ status: "idle" });
+                      }}
+                      className="text-sm font-medium text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-50"
+                    >
+                      Change setup
+                    </button>
+                  )}
+                </div>
+
+                {!ipSetupMode ? (
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <button
+                      type="button"
+                      onClick={() => setIpSetupMode("existing")}
+                      className="flex flex-col items-start rounded-xl border-2 border-zinc-200 p-6 text-left transition-all hover:border-black hover:bg-zinc-50 dark:border-zinc-800 dark:hover:border-white dark:hover:bg-zinc-900"
+                    >
+                      <div className="text-base font-semibold text-zinc-900 dark:text-zinc-50">I already have an account</div>
+                      <div className="mt-1 text-sm text-zinc-500">Retrieve your profile info and auto-fill the form.</div>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setIpSetupMode("new")}
+                      className="flex flex-col items-start rounded-xl border-2 border-zinc-200 p-6 text-left transition-all hover:border-black hover:bg-zinc-50 dark:border-zinc-800 dark:hover:border-white dark:hover:bg-zinc-900"
+                    >
+                      <div className="text-base font-semibold text-zinc-900 dark:text-zinc-50">I don&apos;t have an account yet</div>
+                      <div className="mt-1 text-sm text-zinc-500">Fill in your IP info manually.</div>
+                    </button>
+                  </div>
+                ) : (
+                  <>
+                    {ipSetupMode === "existing" && (
+                      <div className="mb-6 rounded-xl border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+                        <div className="mb-3 text-sm font-semibold text-zinc-900 dark:text-zinc-50">Set up from my account</div>
+                        <div className="grid gap-3 md:grid-cols-[180px_1fr_120px] md:items-end">
+                          <div className="space-y-2">
+                            <label className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Platform</label>
+                            <Select value={ipSourcePlatform} onValueChange={(val) => setIpSourcePlatform(val as IpSourcePlatform)}>
+                              <SelectTrigger className="w-full bg-zinc-50 dark:bg-zinc-900">
+                                <SelectValue placeholder="Select" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="twitter">X (Twitter)</SelectItem>
+                                <SelectItem value="wechat">WeChat</SelectItem>
+                              </SelectContent>
+                            </Select>
+                          </div>
+                          <div className="space-y-2">
+                            <label className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Account</label>
+                            <input
+                              type="text"
+                              placeholder={ipSourcePlatform === "twitter" ? "@username or profile link" : "公众号名称 / ID"}
+                              value={ipSourceAccount}
+                              onChange={(e) => {
+                                setIpSourceAccount(e.target.value);
+                                setIpRetrieveUi({ status: "idle" });
+                              }}
+                              className="w-full rounded-lg border border-zinc-300 bg-zinc-50 px-4 py-2.5 outline-none focus:border-zinc-400 focus:ring-1 focus:ring-zinc-400 dark:border-zinc-700 dark:bg-zinc-900 dark:focus:border-zinc-500 dark:focus:ring-zinc-600"
+                            />
+                          </div>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              void handleRetrieveIpFromAccount();
+                            }}
+                            disabled={ipRetrieveUi.status === "loading"}
+                            className="h-[42px] rounded-lg bg-zinc-900 px-4 font-semibold text-white hover:bg-zinc-800 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200"
+                          >
+                            {ipRetrieveUi.status === "loading" ? (
+                              <span className="flex items-center justify-center gap-2">
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                                获取中...
+                              </span>
+                            ) : (
+                              "获取"
+                            )}
+                          </button>
+                        </div>
+                        {(ipRetrieveUi.status === "error" || ipRetrieveUi.status === "disabled" || ipRetrieveUi.status === "ok") && (
+                          <div
+                            className={`mt-3 text-sm ${
+                              ipRetrieveUi.status === "ok"
+                                ? "text-green-600 dark:text-green-400"
+                                : ipRetrieveUi.status === "disabled"
+                                  ? "text-zinc-500 dark:text-zinc-400"
+                                  : "text-red-600 dark:text-red-400"
+                            }`}
+                          >
+                            {ipRetrieveUi.message || ""}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    <div className="space-y-6">
                     <div className="space-y-2">
                         <label className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Name</label>
                         <div className="relative">
@@ -619,25 +905,27 @@ export default function CreatePersonaPage() {
                           </div>
                         )}
                     </div>
-                </div>
-                <button
-                    type="button"
-                    onClick={(e) => {
-                      e.preventDefault();
-                      void handleCreate();
-                    }}
-                    disabled={isGenerating}
-                    className="mt-8 w-full rounded-lg bg-zinc-900 py-3.5 font-semibold text-white hover:bg-zinc-800 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200"
-                >
-                    {isGenerating ? (
-                        <span className="flex items-center justify-center gap-2">
-                            <Loader2 className="h-4 w-4 animate-spin" />
-                            Saving...
-                        </span>
-                    ) : (
-                        "Continue"
-                    )}
-                </button>
+                    </div>
+                    <button
+                        type="button"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          void handleCreate();
+                        }}
+                        disabled={isGenerating}
+                        className="mt-8 w-full rounded-lg bg-zinc-900 py-3.5 font-semibold text-white hover:bg-zinc-800 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200"
+                    >
+                        {isGenerating ? (
+                            <span className="flex items-center justify-center gap-2">
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                                Saving...
+                            </span>
+                        ) : (
+                            "Continue"
+                        )}
+                    </button>
+                  </>
+                )}
             </div>
         ) : (
             // Existing AI Flow

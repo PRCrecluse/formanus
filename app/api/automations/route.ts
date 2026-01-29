@@ -73,7 +73,7 @@ export async function GET(req: Request) {
     .sort({ updatedAt: -1, createdAt: -1 })
     .toArray();
 
-  await syncAutomationScheduler().catch(() => null);
+  void syncAutomationScheduler().catch(() => null);
 
   return Response.json({ items: docs.map(toApi) });
 }
@@ -136,7 +136,7 @@ export async function POST(req: Request) {
     updatedAt: now,
     });
 
-  await syncAutomationScheduler().catch(() => null);
+  void syncAutomationScheduler().catch(() => null);
 
   return Response.json({ id });
 }

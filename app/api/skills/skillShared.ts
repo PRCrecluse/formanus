@@ -1,5 +1,6 @@
 import { ChatOpenAI } from "@langchain/openai";
 import { createClient } from "@supabase/supabase-js";
+import { ensureDocHtmlContent } from "@/lib/utils";
 
 const MODEL_CONFIGS = [
   { id: "persona-ai", modelId: "google/gemini-3-pro-preview", keyName: "NEXT_PUBLIC_OPENROUTER_API_KEY" },
@@ -67,6 +68,8 @@ export async function createBoardDoc({
   const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
   if (!supabaseUrl || !supabaseAnonKey) return { ok: false, error: "Supabase not configured" };
 
+  const normalizedContent = ensureDocHtmlContent(content);
+
   const supabase = createClient(supabaseUrl, supabaseAnonKey, {
     global: { headers: { Authorization: `Bearer ${accessToken}` } },
   });
@@ -77,7 +80,7 @@ export async function createBoardDoc({
       user_id: userId,
       persona_id: personaId,
       title,
-      content,
+      content: normalizedContent,
       type: "text",
     })
     .select("id")

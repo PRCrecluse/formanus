@@ -20,18 +20,187 @@ import Link from "next/link";
 import { getSessionWithTimeout, supabase } from "@/lib/supabaseClient";
 import { getCleanPersonaDocId, makePersonaDocDbId, normalizePersonaDocType } from "@/lib/utils";
 
-const SimpleMarkdownRenderer = memo(function SimpleMarkdownRenderer({ content }: { content: string }) {
+function splitInline(text: string): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  let i = 0;
+  const pushText = (s: string) => {
+    if (!s) return;
+    out.push(s);
+  };
+  while (i < text.length) {
+    const rest = text.slice(i);
+    const linkMatch = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/.exec(rest);
+    const codeMatch = /`([^`]+)`/.exec(rest);
+    const boldMatch = /\*\*([\s\S]+?)\*\*/.exec(rest);
+
+    const candidates = [linkMatch, codeMatch, boldMatch].filter(Boolean) as RegExpExecArray[];
+    if (candidates.length === 0) {
+      pushText(rest);
+      break;
+    }
+    candidates.sort((a, b) => a.index - b.index);
+    const m = candidates[0]!;
+    const idx = m.index;
+    pushText(rest.slice(0, idx));
+
+    const full = m[0] ?? "";
+    if (m === linkMatch) {
+      const label = m[1] ?? "";
+      const url = m[2] ?? "";
+      out.push(
+        <a key={`a-${i}-${idx}`} href={url} target="_blank" rel="noopener noreferrer" className="text-blue-600 underline">
+          {label || url}
+        </a>
+      );
+    } else if (m === codeMatch) {
+      const code = m[1] ?? "";
+      out.push(
+        <code key={`c-${i}-${idx}`} className="rounded bg-zinc-100 px-1 py-0.5 text-[0.95em] dark:bg-zinc-800">
+          {code}
+        </code>
+      );
+    } else {
+      const strong = m[1] ?? "";
+      out.push(
+        <strong key={`s-${i}-${idx}`} className="font-semibold">
+          {strong}
+        </strong>
+      );
+    }
+    i += idx + full.length;
+  }
+  return out;
+}
+
+function renderMarkdownBlocks(content: string): React.ReactNode[] {
   const lines = (content ?? "").toString().split(/\r?\n/);
-  const elements: React.ReactNode[] = [];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i]!;
+  const blocks: React.ReactNode[] = [];
+  let i = 0;
+  let inCode = false;
+  let codeLines: string[] = [];
+
+  const flushCode = () => {
+    if (!inCode) return;
+    blocks.push(
+      <pre
+        key={`pre-${i}`}
+        className="my-2 overflow-auto rounded-md border border-zinc-200 bg-zinc-50 p-3 text-sm dark:border-zinc-800 dark:bg-zinc-900"
+      >
+        <code className="whitespace-pre">{codeLines.join("\n")}</code>
+      </pre>
+    );
+    inCode = false;
+    codeLines = [];
+  };
+
+  while (i < lines.length) {
+    const rawLine = lines[i] ?? "";
+    const line = rawLine.toString();
+    const trimmed = line.trim();
+
+    if (/^```/.test(trimmed)) {
+      if (inCode) flushCode();
+      else inCode = true;
+      i += 1;
+      continue;
+    }
+    if (inCode) {
+      codeLines.push(line);
+      i += 1;
+      continue;
+    }
+
+    if (!trimmed) {
+      blocks.push(<div key={`sp-${i}`} className="h-3" />);
+      i += 1;
+      continue;
+    }
+
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+      blocks.push(<hr key={`hr-${i}`} className="my-3 border-zinc-200 dark:border-zinc-800" />);
+      i += 1;
+      continue;
+    }
+
+    const heading = /^(#{1,6})\s+(.*)$/.exec(trimmed);
+    if (heading) {
+      const level = heading[1]!.length;
+      const text = heading[2] ?? "";
+      const cls =
+        level <= 2 ? "text-lg font-semibold" : level === 3 ? "text-base font-semibold" : "text-sm font-semibold";
+      blocks.push(
+        <div key={`h-${i}`} className={cls}>
+          {splitInline(text)}
+        </div>
+      );
+      i += 1;
+      continue;
+    }
+
+    if (/^>\s?/.test(trimmed)) {
+      const start = i;
+      const quoteLines: string[] = [];
+      while (i < lines.length) {
+        const t = (lines[i] ?? "").toString().trim();
+        if (!/^>\s?/.test(t)) break;
+        quoteLines.push(t.replace(/^>\s?/, ""));
+        i += 1;
+      }
+      blocks.push(
+        <blockquote
+          key={`bq-${start}`}
+          className="my-2 border-l-2 border-zinc-200 pl-3 text-zinc-700 dark:border-zinc-800 dark:text-zinc-300"
+        >
+          {quoteLines.map((q, qi) => (
+            <div key={`bq-${start}-${qi}`} className="whitespace-pre-wrap">
+              {splitInline(q)}
+            </div>
+          ))}
+        </blockquote>
+      );
+      continue;
+    }
+
+    const listBullet = /^[-*]\s+/.test(trimmed);
+    const listNumber = /^\d+\.\s+/.test(trimmed);
+    if (listBullet || listNumber) {
+      const start = i;
+      const items: string[] = [];
+      const isOrdered = listNumber;
+      while (i < lines.length) {
+        const t = (lines[i] ?? "").toString().trim();
+        if (!t) break;
+        if (isOrdered) {
+          const m = /^(\d+)\.\s+(.*)$/.exec(t);
+          if (!m) break;
+          items.push(m[2] ?? "");
+        } else {
+          const m = /^[-*]\s+(.*)$/.exec(t);
+          if (!m) break;
+          items.push(m[1] ?? "");
+        }
+        i += 1;
+      }
+      const ListTag = isOrdered ? "ol" : "ul";
+      blocks.push(
+        <ListTag key={`list-${start}`} className={`my-2 pl-5 ${isOrdered ? "list-decimal" : "list-disc"}`}>
+          {items.map((it, ii) => (
+            <li key={`li-${start}-${ii}`} className="whitespace-pre-wrap">
+              {splitInline(it)}
+            </li>
+          ))}
+        </ListTag>
+      );
+      continue;
+    }
+
     const imgMatches: Array<{ alt: string; url: string }> = [];
     const replaced = line.replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g, (_m, alt, url) => {
       imgMatches.push({ alt: (alt ?? "").toString() || "Image", url: (url ?? "").toString() });
       return "";
     });
     if (imgMatches.length > 0) {
-      elements.push(
+      blocks.push(
         <div key={`img-${i}`} className="my-2 flex flex-col gap-2">
           {imgMatches.map((m, idx) => (
             <img
@@ -45,51 +214,52 @@ const SimpleMarkdownRenderer = memo(function SimpleMarkdownRenderer({ content }:
         </div>
       );
       if (replaced.trim()) {
-        elements.push(
+        blocks.push(
           <p key={`txt-${i}`} className="whitespace-pre-wrap">
-            {replaced.trim()}
+            {splitInline(replaced.trim())}
           </p>
         );
       }
+      i += 1;
       continue;
     }
+
     const dl = /^下载：\s*(https?:\/\/\S+)/.exec(line);
     if (dl) {
-      elements.push(
-        <a
-          key={`link-${i}`}
-          href={dl[1]}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-blue-600 underline"
-        >
+      blocks.push(
+        <a key={`link-${i}`} href={dl[1]} target="_blank" rel="noopener noreferrer" className="text-blue-600 underline">
           下载资源包
         </a>
       );
+      i += 1;
       continue;
     }
-    const urlOnly = /^(https?:\/\/\S+)$/.exec(line.trim());
+    const urlOnly = /^(https?:\/\/\S+)$/.exec(trimmed);
     if (urlOnly) {
-      elements.push(
-        <a
-          key={`url-${i}`}
-          href={urlOnly[1]}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-blue-600 underline"
-        >
+      blocks.push(
+        <a key={`url-${i}`} href={urlOnly[1]} target="_blank" rel="noopener noreferrer" className="text-blue-600 underline">
           {urlOnly[1]}
         </a>
       );
+      i += 1;
       continue;
     }
-    elements.push(
+
+    blocks.push(
       <p key={`p-${i}`} className="whitespace-pre-wrap">
-        {line}
+        {splitInline(line)}
       </p>
     );
+    i += 1;
   }
-  return <div>{elements}</div>;
+
+  flushCode();
+  return blocks;
+}
+
+const SimpleMarkdownRenderer = memo(function SimpleMarkdownRenderer({ content }: { content: string }) {
+  const blocks = renderMarkdownBlocks(content);
+  return <div>{blocks}</div>;
 });
 
 const MODEL_SETTINGS_KEY = "aipersona.chat.models.enabled";
@@ -320,21 +490,6 @@ const ChatMessageItem = memo(function ChatMessageItem({
           ))}
         </div>
       )}
-      {msg.role === "assistant" && msg.meta?.task_plan && msg.meta.task_plan.length > 0 && (
-        <div className="mt-1 w-full max-w-[80%] rounded-lg border border-zinc-200 bg-white px-3 py-2 text-[11px] text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100">
-          <div className="text-[11px] font-semibold">任务清单</div>
-          <div className="mt-1 flex flex-col gap-1">
-            {msg.meta.task_plan.map((t, idx) => (
-              <div key={`${msg.id}-plan-${idx}`} className="flex items-center justify-between gap-2">
-                <div className="min-w-0 truncate">{t.title}</div>
-                <div className="shrink-0 text-[10px] text-zinc-500 dark:text-zinc-400">
-                  {t.status === "completed" ? "完成" : t.status === "in_progress" ? "进行中" : "待办"}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
       {msg.role === "assistant" && a && a.id && (
         <div className="mt-1 w-full max-w-[80%] rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-[11px] text-amber-900 dark:border-amber-500/60 dark:bg-amber-900/30 dark:text-amber-50">
           <div className="flex items-start justify-between gap-2">
@@ -484,6 +639,7 @@ export default function ChatPage() {
   const [authReady, setAuthReady] = useState(false);
   const [message, setMessage] = useState("");
   const [chatSending, setChatSending] = useState(false);
+  const [waitingForUserInput, setWaitingForUserInput] = useState(false);
   const messagesRef = useRef<Message[]>([]);
   const [pendingAutomationConfirm, setPendingAutomationConfirm] = useState<{
     id: string;
@@ -526,6 +682,7 @@ export default function ChatPage() {
   const [attachedPathRefs, setAttachedPathRefs] = useState<string[]>([]);
   const [attachedDocs, setAttachedDocs] = useState<Record<string, { id: string; title: string | null; type: string | null }>>({});
   const [inputBarCollapsed, setInputBarCollapsed] = useState(false);
+  const [taskPlanCollapsed, setTaskPlanCollapsed] = useState(false);
   const [dragOverInput, setDragOverInput] = useState(false);
   const [dragSource, setDragSource] = useState<"internal" | "external" | null>(null);
 
@@ -534,6 +691,26 @@ export default function ChatPage() {
   const chatAbortControllerRef = useRef<AbortController | null>(null);
   const stopAllRef = useRef(false);
   const historyLoadReqIdRef = useRef(0);
+
+  useEffect(() => {
+    if (chatSending) {
+      setWaitingForUserInput(false);
+      return;
+    }
+    if (!messages || messages.length === 0) {
+      setWaitingForUserInput(false);
+      return;
+    }
+    const last = messages[messages.length - 1]!;
+    if (last.role !== "assistant") {
+      setWaitingForUserInput(false);
+      return;
+    }
+    const text = (last.content ?? "").toString();
+    const hasQuestionMark = /[?？]\s*$/.test(text);
+    const hasPromptPhrase = /请提供|请给出|请告知|please provide|could you provide|please tell me/i.test(text);
+    setWaitingForUserInput(hasQuestionMark || hasPromptPhrase);
+  }, [messages, chatSending]);
 
   const enableAutomation = useCallback(async (automationId: string) => {
     const sessionInfo = await getSessionWithTimeout({ timeoutMs: 4500, retries: 2, retryDelayMs: 200 });
@@ -1324,7 +1501,6 @@ export default function ChatPage() {
           abortController.abort();
         }, ms);
       };
-      let planningMessageId: string | null = null;
       try {
       let currentUserId = userId;
       if (!currentUserId) {
@@ -1370,23 +1546,9 @@ export default function ChatPage() {
       }
 
       const optimisticMessageId = `local-${crypto.randomUUID()}`;
-      planningMessageId = `local-plan-${crypto.randomUUID()}`;
       setMessages((prev) => [
         ...prev,
         { id: optimisticMessageId, role: "user", content: finalContent, created_at: new Date().toISOString(), meta: null },
-        {
-          id: planningMessageId!,
-          role: "assistant",
-          content: "正在规划任务…",
-          created_at: new Date().toISOString(),
-          meta: {
-            task_plan: [
-              { title: "理解需求与约束", status: "in_progress" },
-              { title: "制定执行步骤", status: "pending" },
-              { title: "执行并反馈结果", status: "pending" },
-            ],
-          },
-        },
       ]);
 
       setPendingFiles([]);
@@ -1406,7 +1568,7 @@ export default function ChatPage() {
 
       if (msgError || !savedUser) {
         console.error("Error sending message:", msgError);
-        setMessages((prev) => prev.filter((m) => m.id !== optimisticMessageId && m.id !== planningMessageId));
+        setMessages((prev) => prev.filter((m) => m.id !== optimisticMessageId));
         return;
       }
 
@@ -1486,7 +1648,7 @@ export default function ChatPage() {
           .select("id,role,content,created_at")
           .single();
         if (savedAssistant) {
-          setMessages((prev) => [...prev.filter((m) => m.id !== planningMessageId), parseMessageRow(savedAssistant)]);
+          setMessages((prev) => [...prev, parseMessageRow(savedAssistant)]);
         }
         setQuickAction(null);
       } else if (isDesignImage) {
@@ -1529,7 +1691,7 @@ export default function ChatPage() {
           .select("id,role,content,created_at")
           .single();
         if (savedAssistant) {
-          setMessages((prev) => [...prev.filter((m) => m.id !== planningMessageId), parseMessageRow(savedAssistant)]);
+          setMessages((prev) => [...prev, parseMessageRow(savedAssistant)]);
         }
         setQuickAction(null);
       } else if (isXhsBatch) {
@@ -1709,7 +1871,7 @@ export default function ChatPage() {
           .select("id,role,content,created_at")
           .single();
         if (savedAssistant) {
-          setMessages((prev) => [...prev.filter((m) => m.id !== planningMessageId), parseMessageRow(savedAssistant)]);
+          setMessages((prev) => [...prev, parseMessageRow(savedAssistant)]);
         }
         setQuickAction(null);
       } else {
@@ -1747,7 +1909,7 @@ export default function ChatPage() {
             .single();
           if (savedAssistant) {
             const parsedMsg = parseMessageRow(savedAssistant);
-            setMessages((prev) => [...prev.filter((m) => m.id !== planningMessageId), parsedMsg]);
+            setMessages((prev) => [...prev, parsedMsg]);
             const a = parsedMsg.meta?.automation ?? null;
             if (a && a.id && a.auto_confirm && !a.enabled) {
               setPendingAutomationConfirm({
@@ -1778,7 +1940,7 @@ export default function ChatPage() {
               .select("id,role,content,created_at")
               .single();
             if (savedTimeout) {
-              setMessages((prev) => [...prev.filter((m) => m.id !== planningMessageId), parseMessageRow(savedTimeout)]);
+              setMessages((prev) => [...prev, parseMessageRow(savedTimeout)]);
             }
           }
         } else {
@@ -1807,7 +1969,7 @@ export default function ChatPage() {
               .select("id,role,content,created_at")
               .single();
             if (savedErr) {
-              setMessages((prev) => [...prev.filter((m) => m.id !== planningMessageId), parseMessageRow(savedErr)]);
+              setMessages((prev) => [...prev, parseMessageRow(savedErr)]);
             }
           }
         }
@@ -1817,9 +1979,6 @@ export default function ChatPage() {
         router.push(`/chat/${currentChatId}`);
       }
     } finally {
-      if (planningMessageId) {
-        setMessages((prev) => prev.filter((m) => m.id !== planningMessageId));
-      }
       if (chatAbortControllerRef.current === abortController) {
         chatAbortControllerRef.current = null;
       }
@@ -1859,11 +2018,24 @@ export default function ChatPage() {
   }, [messages]);
 
   const latestTaskPlan = useMemo(() => {
+    const isPlaceholder = (title: string) => {
+      const t = (title ?? "").toString().trim().toLowerCase();
+      return (
+        t === "理解需求与约束" ||
+        t === "制定执行步骤" ||
+        t === "执行并反馈结果" ||
+        t === "understand requirements and constraints" ||
+        t === "plan execution steps" ||
+        t === "execute and report results"
+      );
+    };
     for (let i = messages.length - 1; i >= 0; i -= 1) {
       const m = messages[i];
       if (!m || m.role !== "assistant") continue;
       const plan = m.meta?.task_plan;
-      if (plan && plan.length > 0) return plan;
+      if (!plan || plan.length === 0) continue;
+      const filtered = plan.filter((p) => p && !isPlaceholder(p.title));
+      if (filtered.length > 0) return filtered;
     }
     return null;
   }, [messages]);
@@ -1902,9 +2074,14 @@ export default function ChatPage() {
 
   const renderChatInput = (opts: { showQuickActions: boolean }) => (
     <div>
-      {latestTaskPlan && latestTaskPlan.length > 0 && (
-        <div className="mb-2 rounded-2xl border border-zinc-200 bg-white px-3 py-2 text-[11px] text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100">
-          <div className="text-[11px] font-semibold">任务规划</div>
+      {latestTaskPlan && latestTaskPlan.length > 0 && !taskPlanCollapsed && (
+          <div className="mb-2 rounded-2xl border border-zinc-200 bg-white px-3 py-2 text-[11px] text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100">
+          <div className="flex items-center justify-between">
+2059→            <div className="text-[11px] font-semibold">Task Plan</div>
+            <button type="button" onClick={() => setTaskPlanCollapsed(true)} className="h-4 w-4">
+              <ChevronUp className="h-4 w-4 text-zinc-600 dark:text-zinc-300" />
+            </button>
+          </div>
           <div className="mt-1 flex flex-col gap-1.5">
             {latestTaskPlan.map((t, idx) => (
               <div key={`plan-panel-${idx}`} className="flex items-center gap-2">
@@ -1918,6 +2095,16 @@ export default function ChatPage() {
                 <div className="min-w-0 flex-1 truncate">{t.title}</div>
               </div>
             ))}
+          </div>
+        </div>
+      )}
+      {latestTaskPlan && latestTaskPlan.length > 0 && taskPlanCollapsed && (
+        <div className="mb-2 rounded-2xl border border-zinc-200 bg-white px-3 py-2 text-[11px] text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100">
+          <div className="flex items-center justify-between">
+2083→            <div className="text-[11px] font-semibold">Task Plan</div>
+            <button type="button" onClick={() => setTaskPlanCollapsed(false)} className="h-4 w-4">
+              <ChevronDown className="h-4 w-4 text-zinc-600 dark:text-zinc-300" />
+            </button>
           </div>
         </div>
       )}
@@ -2131,8 +2318,18 @@ export default function ChatPage() {
             <AIInputButton
               type="submit"
               className="h-9 w-9 rounded-full bg-black p-0 text-white hover:bg-zinc-800"
-              onMouseEnter={(e) => showHoverTip("Send", e)}
-              onMouseMove={(e) => showHoverTip("Send", e)}
+              onMouseEnter={(e) =>
+                showHoverTip(
+                  waitingForUserInput ? "Waiting for user input to continue the task" : "Send",
+                  e
+                )
+              }
+              onMouseMove={(e) =>
+                showHoverTip(
+                  waitingForUserInput ? "Waiting for user input to continue the task" : "Send",
+                  e
+                )
+              }
               onMouseLeave={hideHoverTip}
             >
               <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" className="h-4 w-4">
@@ -2147,6 +2344,11 @@ export default function ChatPage() {
             </AIInputButton>
           )}
         </AIInputToolbar>
+        {waitingForUserInput && (
+          <div className="px-3 pb-1 text-[11px] text-zinc-500">
+            Waiting for user input to continue the task
+          </div>
+        )}
         {quickAction && (
           <div className="px-3 pb-2">
             <div className="flex flex-wrap items-center gap-2">

@@ -923,7 +923,7 @@ export default function IntegrationPage() {
                     <h2 className="text-lg font-semibold">{title}</h2>
                     <p className="text-sm text-zinc-500 dark:text-zinc-400">
                       {activeTab === "socialmedia"
-                        ? "Connect X (Twitter), Facebook, and more."
+                        ? "Connect X (Twitter) and more."
                         : "Connect tools like Notion, Slack, and other platforms (coming soon)."}
                     </p>
                   </div>
@@ -1036,7 +1036,6 @@ export default function IntegrationPage() {
                           </div>
                         </div>
                       )}
-                      <IntegrationCard name="Facebook" status="Coming soon" />
                     </>
                   ) : (
                     <>

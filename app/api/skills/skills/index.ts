@@ -9,6 +9,7 @@ import { skill as notionIntegration } from "./notion-integration";
 import { skill as pdf } from "./pdf";
 import { skill as pdfParser } from "./pdf-parser";
 import { skill as postToTwitter } from "./post-to-twitter";
+import { skill as postToWechat } from "./post-to-wechat";
 import { skill as pptx } from "./pptx";
 import { skill as searchQuery } from "./search-query";
 import { skill as wechatCompetitorCollection } from "./wechat-competitor-collection";
@@ -20,6 +21,7 @@ export const SKILLS: Skill[] = [
   wechatCompetitorCollection,
   listTwitterAccounts,
   postToTwitter,
+  postToWechat,
   createBoardDoc,
   searchQuery,
   notionIntegration,

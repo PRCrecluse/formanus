@@ -485,12 +485,21 @@ function normalizeThinkingSteps(value: unknown): Array<{ label: string }> {
 
 function normalizeTaskPlan(value: unknown): Array<{ title: string; status?: "pending" | "in_progress" | "completed" }> {
   if (!Array.isArray(value)) return [];
+  const placeholderTitles = new Set([
+    "理解需求与约束",
+    "制定执行步骤",
+    "执行并反馈结果",
+    "understand requirements and constraints",
+    "plan execution steps",
+    "execute and report results",
+  ]);
   const out: Array<{ title: string; status?: "pending" | "in_progress" | "completed" }> = [];
   for (const it of value) {
     const obj = it && typeof it === "object" ? (it as Record<string, unknown>) : null;
     if (!obj) continue;
     const title = typeof obj.title === "string" ? obj.title.trim() : "";
     if (!title) continue;
+    if (placeholderTitles.has(title.toLowerCase())) continue;
     const statusRaw = typeof obj.status === "string" ? obj.status.trim() : "";
     const status =
       statusRaw === "pending" || statusRaw === "in_progress" || statusRaw === "completed"
@@ -715,6 +724,10 @@ Schema:
     "target": "string"
   }
 }
+Rules:
+- thinking_steps: show high-level progress labels only; do NOT include chain-of-thought.
+- task_plan: only include concrete, user-facing execution steps or deliverables; omit it if you only have generic placeholders.
+- NEVER put generic items like "理解需求与约束" / "制定执行步骤" / "执行并反馈结果" in task_plan.
 If user requests a recurring schedule (e.g. every day 9am), include automation.auto_create=true with a valid cron/timezone.`,
   };
 
@@ -918,10 +931,10 @@ If user requests a recurring schedule (e.g. every day 9am), include automation.a
           taskPlan.length > 0
             ? taskPlan
             : [
-                { title: "解析监控目标", status: "pending" as const },
-                { title: "拉取最新信息", status: "pending" as const },
-                { title: "生成摘要报告", status: "pending" as const },
-                { title: "保存到资源库", status: "pending" as const },
+                { title: "Analyze monitoring target", status: "pending" as const },
+                { title: "Fetch latest information", status: "pending" as const },
+                { title: "Generate summary report", status: "pending" as const },
+                { title: "Save results to library", status: "pending" as const },
               ];
         const todos = todosFromPlan.map((t) => ({ text: t.title, done: t.status === "completed" }));
         const id = await createAutomationFromAgent({

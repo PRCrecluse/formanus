@@ -3,7 +3,7 @@
 import * as React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import {
   Bot,
   CheckSquare,
@@ -111,7 +111,6 @@ function estimateTokens(text: string): number {
   const nonCjkLen = raw.replace(/[\u4e00-\u9fff]/g, "").length;
   return Math.max(1, Math.ceil(cjk + nonCjkLen / 4));
 }
-
 function creditsPerRequestForModelKey(modelKey: string | null | undefined): number {
   if (modelKey === "gpt-oss") return 0;
   if (modelKey === "claude-3.5-sonnet") return 3;
@@ -358,7 +357,7 @@ type ResourceMeta = {
   content?: string | null;
 };
 
-type ResourceTypeFilter = "all" | "album" | "post" | "doc" | "photo";
+type ResourceTypeFilter = "all" | "album" | "post" | "doc" | "photo" | "persona";
 
 const RESOURCE_TYPE_LABELS: Record<ResourceTypeFilter, string> = {
   all: "All",
@@ -366,6 +365,7 @@ const RESOURCE_TYPE_LABELS: Record<ResourceTypeFilter, string> = {
   post: "Post",
   doc: "Doc",
   photo: "Photo",
+  persona: "Persona",
 };
 
 type XhsBatchSkillOutput = {
@@ -382,24 +382,195 @@ type XhsBatchSkillOutput = {
   zip_url?: string | null;
 };
 
-function SimpleMarkdownRenderer({ content }: { content: string }) {
-  const lines = (content ?? "").toString().split(/\r?\n/);
-  const elements: React.ReactNode[] = [];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i]!;
-    // Skip redundant "Generate Image" links if they are standalone or look like a generated action
-    if (/\[(Generate Image|生成图片)\]/i.test(line)) {
-      // Check if it's just the link or has minimal surrounding text
-      const stripped = line.replace(/\[(Generate Image|生成图片)\]\(.*?\)/i, "").trim();
-      if (!stripped || stripped.length < 5) continue;
+function splitInline(text: string): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  let i = 0;
+  const pushText = (s: string) => {
+    if (!s) return;
+    out.push(s);
+  };
+  while (i < text.length) {
+    const rest = text.slice(i);
+    const linkMatch = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/.exec(rest);
+    const codeMatch = /`([^`]+)`/.exec(rest);
+    const boldMatch = /\*\*([\s\S]+?)\*\*/.exec(rest);
+
+    const candidates = [linkMatch, codeMatch, boldMatch].filter(Boolean) as RegExpExecArray[];
+    if (candidates.length === 0) {
+      pushText(rest);
+      break;
     }
+    candidates.sort((a, b) => a.index - b.index);
+    const m = candidates[0]!;
+    const idx = m.index;
+    pushText(rest.slice(0, idx));
+
+    const full = m[0] ?? "";
+    if (m === linkMatch) {
+      const label = m[1] ?? "";
+      const url = m[2] ?? "";
+      out.push(
+        <a key={`a-${i}-${idx}`} href={url} target="_blank" rel="noopener noreferrer" className="text-blue-600 underline">
+          {label || url}
+        </a>
+      );
+    } else if (m === codeMatch) {
+      const code = m[1] ?? "";
+      out.push(
+        <code key={`c-${i}-${idx}`} className="rounded bg-zinc-100 px-1 py-0.5 text-[0.95em] dark:bg-zinc-800">
+          {code}
+        </code>
+      );
+    } else {
+      const strong = m[1] ?? "";
+      out.push(
+        <strong key={`s-${i}-${idx}`} className="font-semibold">
+          {strong}
+        </strong>
+      );
+    }
+    i += idx + full.length;
+  }
+  return out;
+}
+
+function renderMarkdownBlocks(content: string): React.ReactNode[] {
+  const lines = (content ?? "").toString().split(/\r?\n/);
+  const blocks: React.ReactNode[] = [];
+  let i = 0;
+  let inCode = false;
+  let codeLines: string[] = [];
+
+  const flushCode = (keySuffix: number) => {
+    if (!inCode) return;
+    blocks.push(
+      <pre
+        key={`pre-${keySuffix}`}
+        className="my-2 overflow-auto rounded-md border border-zinc-200 bg-zinc-50 p-3 text-sm dark:border-zinc-800 dark:bg-zinc-900"
+      >
+        <code className="whitespace-pre">{codeLines.join("\n")}</code>
+      </pre>
+    );
+    inCode = false;
+    codeLines = [];
+  };
+
+  while (i < lines.length) {
+    const rawLine = lines[i] ?? "";
+    const line = rawLine.toString();
+    const trimmed = line.trim();
+
+    if (/^```/.test(trimmed)) {
+      if (inCode) flushCode(i);
+      else inCode = true;
+      i += 1;
+      continue;
+    }
+    if (inCode) {
+      codeLines.push(line);
+      i += 1;
+      continue;
+    }
+
+    if (!trimmed) {
+      blocks.push(<div key={`sp-${i}`} className="h-3" />);
+      i += 1;
+      continue;
+    }
+
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+      blocks.push(<hr key={`hr-${i}`} className="my-3 border-zinc-200 dark:border-zinc-800" />);
+      i += 1;
+      continue;
+    }
+
+    const heading = /^(#{1,6})\s+(.*)$/.exec(trimmed);
+    if (heading) {
+      const level = heading[1]!.length;
+      const text = heading[2] ?? "";
+      const cls =
+        level <= 2 ? "text-lg font-semibold" : level === 3 ? "text-base font-semibold" : "text-sm font-semibold";
+      blocks.push(
+        <div key={`h-${i}`} className={cls}>
+          {splitInline(text)}
+        </div>
+      );
+      i += 1;
+      continue;
+    }
+
+    if (/^>\s?/.test(trimmed)) {
+      const start = i;
+      const quoteLines: string[] = [];
+      while (i < lines.length) {
+        const t = (lines[i] ?? "").toString().trim();
+        if (!/^>\s?/.test(t)) break;
+        quoteLines.push(t.replace(/^>\s?/, ""));
+        i += 1;
+      }
+      blocks.push(
+        <blockquote
+          key={`bq-${start}`}
+          className="my-2 border-l-2 border-zinc-200 pl-3 text-zinc-700 dark:border-zinc-800 dark:text-zinc-300"
+        >
+          {quoteLines.map((q, qi) => (
+            <div key={`bq-${start}-${qi}`} className="whitespace-pre-wrap">
+              {splitInline(q)}
+            </div>
+          ))}
+        </blockquote>
+      );
+      continue;
+    }
+
+    const listBullet = /^[-*]\s+/.test(trimmed);
+    const listNumber = /^\d+\.\s+/.test(trimmed);
+    if (listBullet || listNumber) {
+      const start = i;
+      const items: string[] = [];
+      const isOrdered = listNumber;
+      while (i < lines.length) {
+        const t = (lines[i] ?? "").toString().trim();
+        if (!t) break;
+        if (isOrdered) {
+          const m = /^(\d+)\.\s+(.*)$/.exec(t);
+          if (!m) break;
+          items.push(m[2] ?? "");
+        } else {
+          const m = /^[-*]\s+(.*)$/.exec(t);
+          if (!m) break;
+          items.push(m[1] ?? "");
+        }
+        i += 1;
+      }
+      const ListTag = isOrdered ? "ol" : "ul";
+      blocks.push(
+        <ListTag key={`list-${start}`} className={`my-2 pl-5 ${isOrdered ? "list-decimal" : "list-disc"}`}>
+          {items.map((it, ii) => (
+            <li key={`li-${start}-${ii}`} className="whitespace-pre-wrap">
+              {splitInline(it)}
+            </li>
+          ))}
+        </ListTag>
+      );
+      continue;
+    }
+
+    if (/\[(Generate Image|生成图片)\]/i.test(line)) {
+      const stripped = line.replace(/\[(Generate Image|生成图片)\]\(.*?\)/i, "").trim();
+      if (!stripped || stripped.length < 5) {
+        i += 1;
+        continue;
+      }
+    }
+
     const imgMatches: Array<{ alt: string; url: string }> = [];
     const replaced = line.replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g, (_m, alt, url) => {
       imgMatches.push({ alt: (alt ?? "").toString() || "Image", url: (url ?? "").toString() });
       return "";
     });
     if (imgMatches.length > 0) {
-      elements.push(
+      blocks.push(
         <div key={`img-${i}`} className="my-2 flex flex-col gap-2">
           {imgMatches.map((m, idx) => (
             <ChatImage key={`img-${i}-${idx}`} alt={m.alt} url={m.url} />
@@ -407,30 +578,41 @@ function SimpleMarkdownRenderer({ content }: { content: string }) {
         </div>
       );
       if (replaced.trim()) {
-        elements.push(
+        blocks.push(
           <p key={`txt-${i}`} className="whitespace-pre-wrap">
-            {replaced.trim()}
+            {splitInline(replaced.trim())}
           </p>
         );
       }
+      i += 1;
       continue;
     }
+
     const dl = /^下载：\s*(https?:\/\/\S+)/.exec(line);
     if (dl) {
-      elements.push(
+      blocks.push(
         <a key={`link-${i}`} href={dl[1]} target="_blank" rel="noopener noreferrer" className="text-blue-600 underline">
           下载资源包
         </a>
       );
+      i += 1;
       continue;
     }
-    elements.push(
+
+    blocks.push(
       <p key={`line-${i}`} className="whitespace-pre-wrap">
-        {line}
+        {splitInline(line)}
       </p>
     );
+    i += 1;
   }
-  return <>{elements}</>;
+
+  flushCode(i);
+  return blocks;
+}
+
+function SimpleMarkdownRenderer({ content }: { content: string }) {
+  return <>{renderMarkdownBlocks(content)}</>;
 }
 
 function ChatImage({ url, alt }: { url: string; alt: string }) {
@@ -1163,15 +1345,18 @@ export default function BoardPage() {
   const chatHistory = useChatHistory();
   const sidePeekHref = useSidePeekHref();
   const router = useRouter();
+  const searchParams = useSearchParams();
   const [selectedModel, setSelectedModel] = useState<string>(() => MODELS[0]?.id ?? "gpt-5.2");
   const [enabledModelIds, setEnabledModelIds] = useState<string[]>(() => MODELS.map((m) => m.id));
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
   const [attachedResourceIds, setAttachedResourceIds] = useState<string[]>([]);
   const [attachedPathRefs, setAttachedPathRefs] = useState<string[]>([]);
   const [inputBarCollapsed, setInputBarCollapsed] = useState(false);
+  const [taskPlanCollapsed, setTaskPlanCollapsed] = useState(false);
   const [resourceViewMode, setResourceViewMode] = useState<"grid" | "list">("grid");
   const [leftPaneMode, setLeftPaneMode] = useState<"resources" | "doc">("resources");
   const [chatMode, setChatMode] = useState<BoardChatMode>("create");
+  const [chatCollapsed, setChatCollapsed] = useState(false);
   const stopEvent = (e: { preventDefault: () => void; stopPropagation: () => void }) => {
     e.preventDefault();
     e.stopPropagation();
@@ -1223,6 +1408,7 @@ export default function BoardPage() {
   const [userId, setUserId] = useState<string | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
   const [askDefaultModelId, setAskDefaultModelId] = useState<string>("minimax-m2");
+  const [initialDocFocusApplied, setInitialDocFocusApplied] = useState(false);
 
   const enabledModels = useMemo(() => {
     const allowed = new Set(enabledModelIds);
@@ -1338,6 +1524,7 @@ export default function BoardPage() {
   const [createResourceMenuOpen, setCreateResourceMenuOpen] = useState(false);
   const createResourceButtonRef = useRef<HTMLButtonElement | null>(null);
   const createResourceMenuRef = useRef<HTMLDivElement | null>(null);
+  const [waitingForUserInput, setWaitingForUserInput] = useState(false);
 
   useEffect(() => {
     if (quickAction !== "Design Image") return;
@@ -1396,6 +1583,26 @@ export default function BoardPage() {
     window.addEventListener("pointerdown", handler, true);
     return () => window.removeEventListener("pointerdown", handler, true);
   }, [createResourceMenuOpen, showHistory]);
+
+  useEffect(() => {
+    if (chatSending) {
+      setWaitingForUserInput(false);
+      return;
+    }
+    if (!chatMessages || chatMessages.length === 0) {
+      setWaitingForUserInput(false);
+      return;
+    }
+    const last = chatMessages[chatMessages.length - 1]!;
+    if (last.role !== "assistant") {
+      setWaitingForUserInput(false);
+      return;
+    }
+    const text = (last.content ?? "").toString();
+    const hasQuestionMark = /[?？]\s*$/.test(text);
+    const hasPromptPhrase = /请提供|请给出|请告知|please provide|could you provide|please tell me/i.test(text);
+    setWaitingForUserInput(hasQuestionMark || hasPromptPhrase);
+  }, [chatMessages, chatSending]);
 
   const createPrivateResource = useCallback(
     async (kind: "doc" | "posts") => {
@@ -1469,10 +1676,11 @@ export default function BoardPage() {
     (value: string | null | undefined): ResourceTypeFilter => {
       const raw = (value ?? "").toString().toLowerCase();
       const base = getBaseType(raw);
+      if (base === "persona" || raw.includes("persona")) return "persona";
       if (base.includes("album")) return "album";
       if (base.includes("post")) return "post";
       if (base.includes("photo") || base.includes("image") || base.includes("video")) return "photo";
-      if (base.includes("doc") || base === "persona") return "doc";
+      if (base.includes("doc")) return "doc";
       if (raw.includes("album")) return "album";
       if (raw.includes("post")) return "post";
       if (raw.includes("photo") || raw.includes("image") || raw.includes("video")) return "photo";
@@ -1527,6 +1735,9 @@ export default function BoardPage() {
     [getBaseType, getResourceKind]
   );
 
+  const [automationSwitchState, setAutomationSwitchState] = useState<Record<string, boolean>>({});
+  const [showAutomationSwitchForMessageId, setShowAutomationSwitchForMessageId] = useState<string | null>(null);
+
   const resourcesRef = useRef<ResourceDoc[]>([]);
   const chatMessagesRef = useRef<BoardChatMessage[]>([]);
   const revertSnapshotsRef = useRef<Map<string, BoardRevertSnapshot>>(new Map());
@@ -1567,6 +1778,17 @@ export default function BoardPage() {
       method: "PATCH",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
       body: JSON.stringify({ enabled: true }),
+    }).catch(() => null);
+  }, []);
+
+  const setAutomationEnabled = useCallback(async (automationId: string, enabled: boolean) => {
+    const sessionInfo = await getSessionWithTimeout({ timeoutMs: 4500, retries: 2, retryDelayMs: 200 });
+    const token = sessionInfo.session?.access_token ?? "";
+    if (!token) return;
+    await fetch(`/api/automations/${encodeURIComponent(automationId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ enabled }),
     }).catch(() => null);
   }, []);
 
@@ -1716,11 +1938,39 @@ export default function BoardPage() {
       .slice(0, 30);
   }, [resourceSearchQuery, resources]);
 
+  const resolveResourceByIdCandidate = useCallback(
+    (id: string | null, personaHint?: string | null) => {
+      const rawId = (id ?? "").toString().trim();
+      if (!rawId) return null;
+      const persona = (personaHint ?? "").toString().trim();
+
+      const direct = resources.find(
+        (r) => r.id === rawId && (!persona || (r.persona_id ?? "") === persona)
+      );
+      if (direct) return direct ?? null;
+
+      const byClean = resources.find((r) => {
+        if (persona && (r.persona_id ?? "") !== persona) return false;
+        return getCleanDocId(r.id, r.persona_id) === rawId;
+      });
+      if (byClean) return byClean ?? null;
+
+      const bySuffix = resources.find((r) => {
+        if (persona && (r.persona_id ?? "") !== persona) return false;
+        return r.id.endsWith(`-${rawId}`);
+      });
+      return bySuffix ?? null;
+    },
+    [getCleanDocId, resources]
+  );
+
   useEffect(() => {
     if (!listFolderId) return;
     const exists = resources.some((r) => r.id === listFolderId);
     if (!exists) setListFolderId(null);
   }, [listFolderId, resources]);
+
+
 
   const handleMessageChange = useCallback(
     (value: string) => {
@@ -2187,6 +2437,35 @@ export default function BoardPage() {
       isFetchingNextRef.current = false;
     }
   }, [hasMore, nextOffset, pageSize, userId]);
+
+  useEffect(() => {
+    if (initialDocFocusApplied) return;
+    const rawDocParam =
+      searchParams.get("docId") ?? searchParams.get("doc") ?? searchParams.get("resource");
+    const rawPersonaParam = searchParams.get("personaId");
+    const docIdFromParam = (rawDocParam ?? "").toString().trim();
+    const personaFromParam = (rawPersonaParam ?? "").toString().trim() || null;
+
+    if (!docIdFromParam) {
+      setInitialDocFocusApplied(true);
+      return;
+    }
+
+    const target = resolveResourceByIdCandidate(docIdFromParam, personaFromParam);
+    if (!target) {
+      if (hasMore) {
+        void fetchNextPage();
+        return;
+      }
+      setInitialDocFocusApplied(true);
+      return;
+    }
+
+    setSelectedResourcePersonaIdHint(target.persona_id ?? null);
+    setSelectedResourceId(target.id);
+    setLeftPaneMode("doc");
+    setInitialDocFocusApplied(true);
+  }, [fetchNextPage, hasMore, initialDocFocusApplied, resolveResourceByIdCandidate, searchParams]);
 
   useEffect(() => {
     const el = resourcesScrollRef.current;
@@ -3039,11 +3318,31 @@ export default function BoardPage() {
     let token = "";
     let sessionTimedOut = false;
     try {
-      const sessionInfo = await getSessionWithTimeout({ timeoutMs: 4500, retries: 3, retryDelayMs: 200 });
+      const sessionInfo = await getSessionWithTimeout({
+        timeoutMs: 4500,
+        retries: 3,
+        retryDelayMs: 200,
+        signal: abortController.signal,
+      });
       token = sessionInfo.session?.access_token ?? "";
       sessionTimedOut = Boolean(sessionInfo.timedOut);
     } catch {
       token = "";
+    }
+
+    if (abortController.signal.aborted || stopAllRef.current) {
+      setChatMessages((prev) =>
+        prev.map((m) =>
+          m.id === pending.thinkingId
+            ? {
+                ...m,
+                content: "已停止生成",
+                steps: [...(m.steps ?? []), { id: crypto.randomUUID(), type: "info", label: "已停止" }],
+              }
+            : m
+        )
+      );
+      return;
     }
 
     const requestId = pending.id;
@@ -3089,10 +3388,15 @@ export default function BoardPage() {
         visibility: typeof document !== "undefined" ? document.visibilityState : null,
       });
       if (sessionTimedOut) {
-        updateThinking((m) => ({ ...m, content: "会话获取超时，请稍后重试", kind: "status" }));
+        updateThinking((m) => ({ ...m, content: "Session fetch timed out. Please try again later.", kind: "status" }));
         setChatMessages((prev) => [
           ...prev,
-          { id: crypto.randomUUID(), role: "assistant", content: "会话获取超时（你可能仍处于登录状态）。请稍后重试，或刷新页面。", kind: "normal" },
+          {
+            id: crypto.randomUUID(),
+            role: "assistant",
+            content: "Session fetch timed out (you might still be logged in). Please try again later or refresh the page.",
+            kind: "normal",
+          },
         ]);
         return;
       }
@@ -4115,13 +4419,7 @@ export default function BoardPage() {
         content: "Analyzing your instruction...",
         kind: "status",
         steps: initialSteps,
-        meta: {
-          task_plan: [
-            { title: "理解需求与约束", status: "in_progress" },
-            { title: "制定执行步骤", status: "pending" },
-            { title: "执行并反馈结果", status: "pending" },
-          ],
-        },
+        meta: null,
       };
       setChatMessages((prev) => [...prev, userMessage, thinkingMessage]);
       setMessage("");
@@ -4285,11 +4583,24 @@ export default function BoardPage() {
     return null;
   })();
   const latestTaskPlan = (() => {
+    const isPlaceholder = (title: string) => {
+      const t = (title ?? "").toString().trim().toLowerCase();
+      return (
+        t === "理解需求与约束" ||
+        t === "制定执行步骤" ||
+        t === "执行并反馈结果" ||
+        t === "understand requirements and constraints" ||
+        t === "plan execution steps" ||
+        t === "execute and report results"
+      );
+    };
     for (let i = chatMessages.length - 1; i >= 0; i -= 1) {
       const m = chatMessages[i];
       if (!m || m.role !== "assistant") continue;
       const plan = m.meta?.task_plan;
-      if (plan && plan.length > 0) return plan;
+      if (!plan || plan.length === 0) continue;
+      const filtered = plan.filter((p) => p && !isPlaceholder(p.title));
+      if (filtered.length > 0) return filtered;
     }
     return null;
   })();
@@ -4976,8 +5287,8 @@ export default function BoardPage() {
                 </div>,
                 document.body
               )}
-          </>
-        )}
+            </>
+          )}
       </div>
 
       {!sidePeekActive && (
@@ -5002,7 +5313,16 @@ export default function BoardPage() {
         <div className="flex min-w-0 flex-1 flex-col bg-[#FCFCFC] p-6 lg:min-w-[360px] h-full min-h-0 dark:bg-zinc-900">
           <div ref={chatPanelRef} className="relative flex min-w-0 flex-1 flex-col h-full min-h-0">
           <div className="mb-6 flex items-center justify-between">
-            <h2 className="text-lg font-bold">Chat</h2>
+            <button
+              type="button"
+              onClick={() => setChatCollapsed((v) => !v)}
+              className="flex items-center gap-2 text-lg font-bold"
+              aria-expanded={!chatCollapsed}
+              aria-controls="board-chat-panel-body"
+            >
+              <span>Chat</span>
+              {chatCollapsed ? <ChevronDown className="h-5 w-5" /> : <ChevronUp className="h-5 w-5" />}
+            </button>
             <div className="relative flex items-center gap-2 text-zinc-400">
               <BoardChatModeToggle value={chatMode} onValueChange={setChatMode} disabled={chatSending} />
               <button
@@ -5188,7 +5508,12 @@ export default function BoardPage() {
                                   });
                                   if (sessionInfo.timedOut) {
                                     setChatMessages([
-                                      { id: crypto.randomUUID(), role: "assistant", content: "会话获取超时，请稍后重试或刷新页面。", kind: "normal" },
+                                      {
+                                        id: crypto.randomUUID(),
+                                        role: "assistant",
+                                        content: "Session fetch timed out. Please try again later or refresh the page.",
+                                        kind: "normal",
+                                      },
                                     ]);
                                     return;
                                   }
@@ -5319,6 +5644,7 @@ export default function BoardPage() {
             </div>
           </div>
 
+          <div id="board-chat-panel-body" className="contents">
           {chatMessages.length === 0 ? (
             <div className="flex min-h-0 flex-col items-center justify-start text-center py-6">
               <div className="mb-6">
@@ -5572,57 +5898,79 @@ export default function BoardPage() {
                         })()}
                       </div>
                     )}
-                    {m.role === "assistant" && !m.meta?.automation && m.meta?.task_plan && m.meta.task_plan.length > 0 && (
-                      <div className="mr-auto mt-2 flex w-full max-w-[85%] flex-col gap-2 pl-0 text-[11px]">
-                        <div className="rounded-xl border border-zinc-200 bg-white px-3 py-2 text-zinc-800 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100">
-                          <div className="text-[11px] font-semibold">任务清单</div>
-                          <ul className="mt-1 space-y-0.5 text-[10px] text-zinc-600 dark:text-zinc-300">
-                            {m.meta.task_plan.map((t, idx) => (
-                              <li key={`${m.id}:planonly:${idx}`} className="flex items-center gap-1.5">
-                                <span className="h-1.5 w-1.5 rounded-full bg-zinc-400" />
-                                <span className="flex-1 truncate">
-                                  {t.title}
-                                  {t.status && t.status !== "pending" ? ` · ${t.status}` : ""}
-                                </span>
-                              </li>
-                            ))}
-                          </ul>
-                        </div>
-                      </div>
-                    )}
                     {m.role === "assistant" && m.meta?.automation && (
                       <div className="mr-auto mt-2 flex w-full max-w-[85%] flex-col gap-2 pl-0 text-[11px]">
-                        <div className="rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-amber-900 dark:border-amber-500/60 dark:bg-amber-900/30 dark:text-amber-50">
+                        <div className="rounded-2xl border border-zinc-200 bg-white px-3 py-2 text-zinc-800 shadow-sm dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100">
                           <div className="flex items-center justify-between gap-2">
                             <div className="flex flex-col gap-0.5">
                               <span className="text-[11px] font-semibold">
                                 自动化任务预览：{m.meta.automation.name || "未命名自动化"}
                               </span>
-                              <span className="text-[10px] text-amber-800/80 dark:text-amber-100/80">
+                              <span className="text-[10px] text-zinc-500 dark:text-zinc-400">
                                 调度：{m.meta.automation.cron} · 当前状态：{m.meta.automation.enabled ? "已启用" : "待确认"}
                               </span>
                             </div>
-                          </div>
-                          {m.meta.task_plan && m.meta.task_plan.length > 0 && (
-                            <div className="mt-2 rounded-lg bg-amber-100/70 px-2 py-1.5 text-[10px] text-amber-900 dark:bg-amber-900/60 dark:text-amber-50">
-                              <div className="mb-1 font-semibold">任务清单</div>
-                              <ul className="space-y-0.5">
-                                {m.meta.task_plan.map((t, idx) => (
-                                  <li key={`${m.id}:plan:${idx}`} className="flex items-center gap-1.5">
-                                    <span className="h-1.5 w-1.5 rounded-full bg-amber-500" />
-                                    <span className="flex-1 truncate">
-                                      {t.title}
-                                      {t.status && t.status !== "pending" ? ` · ${t.status}` : ""}
-                                    </span>
-                                  </li>
-                                ))}
-                              </ul>
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const id = m.meta?.automation?.id;
+                                  if (!id) return;
+                                  router.push(`/automation?id=${encodeURIComponent(id)}`);
+                                }}
+                                className="inline-flex h-7 items-center justify-center rounded-md border border-zinc-200 px-2 text-[10px] font-medium text-zinc-700 hover:bg-zinc-100 hover:text-zinc-900 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                              >
+                                View
+                              </button>
+                              {!m.meta.automation.enabled && showAutomationSwitchForMessageId !== m.id && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const a = m.meta!.automation!;
+                                    setAutomationSwitchState((prev) => ({
+                                      ...prev,
+                                      [a.id]: true,
+                                    }));
+                                    setShowAutomationSwitchForMessageId(m.id);
+                                    void enableAutomation(a.id);
+                                    setPendingAutomationConfirm(null);
+                                  }}
+                                  className="inline-flex h-7 items-center justify-center rounded-md border border-zinc-200 px-2 text-[10px] font-semibold text-zinc-700 hover:bg-zinc-100 hover:text-zinc-900 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                                >
+                                  确认
+                                </button>
+                              )}
+                              {showAutomationSwitchForMessageId === m.id && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const a = m.meta!.automation!;
+                                    const next = !Boolean(automationSwitchState[a.id] ?? a.enabled);
+                                    setAutomationSwitchState((prev) => ({ ...prev, [a.id]: next }));
+                                    void setAutomationEnabled(a.id, next);
+                                  }}
+                                  className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                                    (automationSwitchState[m.meta.automation.id] ?? m.meta.automation.enabled)
+                                      ? "bg-blue-600"
+                                      : "bg-zinc-300 dark:bg-zinc-700"
+                                  }`}
+                                  aria-pressed={(automationSwitchState[m.meta.automation.id] ?? m.meta.automation.enabled) ? true : false}
+                                >
+                                  <span
+                                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                                      (automationSwitchState[m.meta.automation.id] ?? m.meta.automation.enabled)
+                                        ? "translate-x-4"
+                                        : "translate-x-1"
+                                    }`}
+                                  />
+                                </button>
+                              )}
                             </div>
-                          )}
+                          </div>
                           {m.meta.automation.auto_confirm &&
                             !m.meta.automation.enabled &&
                             pendingAutomationConfirm?.id === m.meta.automation.id && (
-                            <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px]">
+                            <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px] text-zinc-600 dark:text-zinc-300">
                               <span>
                                 将在
                                 {(() => {
@@ -5641,7 +5989,7 @@ export default function BoardPage() {
                                     void enableAutomation(a.id);
                                     setPendingAutomationConfirm(null);
                                   }}
-                                  className="rounded-md bg-amber-500 px-2 py-1 text-[10px] font-semibold text-white hover:bg-amber-600"
+                                  className="inline-flex h-7 items-center justify-center rounded-md bg-zinc-900 px-2 text-[10px] font-semibold text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200"
                                 >
                                   立即启用
                                 </button>
@@ -5652,7 +6000,7 @@ export default function BoardPage() {
                                     void cancelAutomation(a.id);
                                     setPendingAutomationConfirm(null);
                                   }}
-                                  className="rounded-md border border-amber-400 px-2 py-1 text-[10px] font-medium text-amber-900 hover:bg-amber-100 dark:border-amber-500/80 dark:text-amber-50 dark:hover:bg-amber-900/60"
+                                  className="inline-flex h-7 items-center justify-center rounded-md border border-zinc-200 px-2 text-[10px] font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-800"
                                 >
                                   取消并删除
                                 </button>
@@ -5788,9 +6136,14 @@ export default function BoardPage() {
             ref={inputWindowRef}
             className={`${chatMessages.length === 0 ? "mt-4" : "mt-auto"} w-full max-w-full`}
           >
-          {latestTaskPlan && latestTaskPlan.length > 0 && (
+          {latestTaskPlan && latestTaskPlan.length > 0 && !taskPlanCollapsed && (
             <div className="mb-2 rounded-2xl border border-zinc-200 bg-white px-3 py-2 text-[11px] text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100">
-              <div className="text-[11px] font-semibold">任务规划</div>
+              <div className="flex items-center justify-between">
+                <div className="text-[11px] font-semibold">Task Plan</div>
+                <button type="button" onClick={() => setTaskPlanCollapsed(true)} className="h-4 w-4">
+                  <ChevronUp className="h-4 w-4 text-zinc-600 dark:text-zinc-300" />
+                </button>
+              </div>
               <div className="mt-1 flex flex-col gap-1.5">
                 {latestTaskPlan.map((t, idx) => (
                   <div key={`plan-panel-${idx}`} className="flex items-center gap-2">
@@ -5804,6 +6157,16 @@ export default function BoardPage() {
                     <div className="min-w-0 flex-1 truncate">{t.title}</div>
                   </div>
                 ))}
+              </div>
+            </div>
+          )}
+          {latestTaskPlan && latestTaskPlan.length > 0 && taskPlanCollapsed && (
+            <div className="mb-2 rounded-2xl border border-zinc-200 bg-white px-3 py-2 text-[11px] text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100">
+              <div className="flex items-center justify-between">
+                <div className="text-[11px] font-semibold">Task Plan</div>
+                <button type="button" onClick={() => setTaskPlanCollapsed(false)} className="h-4 w-4">
+                  <ChevronDown className="h-4 w-4 text-zinc-600 dark:text-zinc-300" />
+                </button>
               </div>
             </div>
           )}
@@ -6005,7 +6368,7 @@ export default function BoardPage() {
                   </AIInputModelSelect>
                 )}
               </AIInputTools>
-              {chatSending && !message.trim() ? (
+              {chatSending ? (
                 <AIInputButton
                   type="button"
                   className="h-9 w-9 rounded-full bg-black p-0 text-white hover:bg-zinc-800"
@@ -6021,8 +6384,8 @@ export default function BoardPage() {
                 <AIInputButton
                   type="submit"
                   className="h-9 w-9 rounded-full bg-black p-0 text-white hover:bg-zinc-800"
-                  onMouseEnter={(e) => showHoverTip("Send", e)}
-                  onMouseMove={(e) => showHoverTip("Send", e)}
+                  onMouseEnter={(e) => showHoverTip(waitingForUserInput ? "Waiting for user input to continue the task" : "Send", e)}
+                  onMouseMove={(e) => showHoverTip(waitingForUserInput ? "Waiting for user input to continue the task" : "Send", e)}
                   onMouseLeave={hideHoverTip}
                 >
                   <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" className="h-4 w-4">
@@ -6037,6 +6400,11 @@ export default function BoardPage() {
                 </AIInputButton>
               )}
             </AIInputToolbar>
+            {waitingForUserInput && (
+              <div className="px-3 pb-1 text-[11px] text-zinc-500">
+                Waiting for user input to continue the task
+              </div>
+            )}
             {quickAction && (
               <div className="px-3 pb-2">
                 <div className="flex items-center gap-2">
@@ -6102,6 +6470,7 @@ export default function BoardPage() {
               </button>
             </div>
           )}
+          </div>
           </div>
           </div>
         </div>
