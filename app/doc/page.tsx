@@ -90,6 +90,7 @@ export default function DocPage() {
         privacy: "Privacy Policy",
         nav: {
           overview: "Overview",
+          mintlify: "Mintlify Hosting",
           credits: "1. What are Credits",
           plans: "2. Membership & Monthly Credits",
           models: "3. Model Pricing (Credits)",
@@ -102,6 +103,69 @@ export default function DocPage() {
         overviewTitle: "Billing & Credits Guide",
         overviewIntro:
           "Persona AI uses a 'usage-based billing + Credits quota' model to settle the cost of your LLM operations in Chatbox. This page helps you understand how to purchase Credits, how many Credits are included per membership, and approximate consumption for each model.",
+        mintlifyTitle: "Host docs on Mintlify",
+        mintlifyIntro:
+          "We host the documentation on Mintlify and proxy it to a subpath under our main domain. Follow the Mintlify deployment guide and use the Vercel rewrites below to serve docs at a subpath.",
+        mintlifySteps: [
+          "Open Mintlify dashboard → Custom domain setup and enable Host at subpath.",
+          "Make sure the Mintlify project domain is ready and note the subdomain from the dashboard URL.",
+          "Add the rewrites below to vercel.json (replace subdomain and subpath).",
+        ],
+        mintlifyLinksLabel: "Reference docs",
+        mintlifyLinks: [
+          {
+            label: "Mintlify Vercel subpath guide",
+            href: "https://www.mintlify.com/docs/deploy/vercel.md",
+          },
+          {
+            label: "Documentation index (llms.txt)",
+            href: "https://www.mintlify.com/docs/llms.txt",
+          },
+        ],
+        mintlifyCode: `{
+  "rewrites": [
+    {
+      "source": "/_mintlify/:path*",
+      "destination": "https://[subdomain].mintlify.app/_mintlify/:path*"
+    },
+    {
+      "source": "/api/request",
+      "destination": "https://[subdomain].mintlify.app/_mintlify/api/request"
+    },
+    {
+      "source": "/[subpath]",
+      "destination": "https://[subdomain].mintlify.app/[subpath]"
+    },
+    {
+      "source": "/[subpath]/llms.txt",
+      "destination": "https://[subdomain].mintlify.app/llms.txt"
+    },
+    {
+      "source": "/[subpath]/llms-full.txt",
+      "destination": "https://[subdomain].mintlify.app/llms-full.txt"
+    },
+    {
+      "source": "/[subpath]/sitemap.xml",
+      "destination": "https://[subdomain].mintlify.app/sitemap.xml"
+    },
+    {
+      "source": "/[subpath]/robots.txt",
+      "destination": "https://[subdomain].mintlify.app/robots.txt"
+    },
+    {
+      "source": "/[subpath]/mcp",
+      "destination": "https://[subdomain].mintlify.app/mcp"
+    },
+    {
+      "source": "/[subpath]/:path*",
+      "destination": "https://[subdomain].mintlify.app/[subpath]/:path*"
+    },
+    {
+      "source": "/mintlify-assets/:path+",
+      "destination": "https://[subdomain].mintlify.app/mintlify-assets/:path+"
+    }
+  ]
+}`,
         creditsTitle: "1. What are Credits?",
         creditsBody:
           "Credits represent your LLM usage quota. All chats, generations, and model calls are deducted from Credits according to the tokens used. We measure usage by tokens:",
@@ -156,6 +220,7 @@ export default function DocPage() {
       privacy: "隐私政策",
       nav: {
         overview: "概览",
+        mintlify: "Mintlify 托管",
         credits: "1. Credits 是什么",
         plans: "2. 会员与每月 Credits",
         models: "3. 模型扣费标准",
@@ -167,6 +232,69 @@ export default function DocPage() {
       },
       overviewTitle: "计费与 Credits 使用说明",
       overviewIntro: "Persona AI 使用「按模型使用量计费 + Credits 额度」的方式，对你在 Chatbox 中调用大模型的开销进行结算。本页面帮助你快速理解：如何购买 Credits、不同会员每月包含多少 Credits，以及每个模型大概消耗多少 Credits。",
+      mintlifyTitle: "使用 Mintlify 托管文档",
+      mintlifyIntro:
+        "我们的文档托管在 Mintlify，通过 Vercel 子路径反向代理到主站域名。请按 Mintlify 的部署指引开启子路径托管，并在 vercel.json 中加入下列 rewrites。",
+      mintlifySteps: [
+        "进入 Mintlify Dashboard → Custom domain setup，开启 Host at subpath。",
+        "确认项目域名可用，并记录 dashboard URL 末尾的 subdomain。",
+        "在 vercel.json 中添加下面的 rewrites，替换 subdomain 与 subpath。",
+      ],
+      mintlifyLinksLabel: "参考文档",
+      mintlifyLinks: [
+        {
+          label: "Vercel 子路径部署指南",
+          href: "https://www.mintlify.com/docs/deploy/vercel.md",
+        },
+        {
+          label: "文档索引（llms.txt）",
+          href: "https://www.mintlify.com/docs/llms.txt",
+        },
+      ],
+      mintlifyCode: `{
+  "rewrites": [
+    {
+      "source": "/_mintlify/:path*",
+      "destination": "https://[subdomain].mintlify.app/_mintlify/:path*"
+    },
+    {
+      "source": "/api/request",
+      "destination": "https://[subdomain].mintlify.app/_mintlify/api/request"
+    },
+    {
+      "source": "/[subpath]",
+      "destination": "https://[subdomain].mintlify.app/[subpath]"
+    },
+    {
+      "source": "/[subpath]/llms.txt",
+      "destination": "https://[subdomain].mintlify.app/llms.txt"
+    },
+    {
+      "source": "/[subpath]/llms-full.txt",
+      "destination": "https://[subdomain].mintlify.app/llms-full.txt"
+    },
+    {
+      "source": "/[subpath]/sitemap.xml",
+      "destination": "https://[subdomain].mintlify.app/sitemap.xml"
+    },
+    {
+      "source": "/[subpath]/robots.txt",
+      "destination": "https://[subdomain].mintlify.app/robots.txt"
+    },
+    {
+      "source": "/[subpath]/mcp",
+      "destination": "https://[subdomain].mintlify.app/mcp"
+    },
+    {
+      "source": "/[subpath]/:path*",
+      "destination": "https://[subdomain].mintlify.app/[subpath]/:path*"
+    },
+    {
+      "source": "/mintlify-assets/:path+",
+      "destination": "https://[subdomain].mintlify.app/mintlify-assets/:path+"
+    }
+  ]
+}`,
       creditsTitle: "1. Credits 是什么？",
       creditsBody: "Credits 可以理解为「大模型调用额度」，所有在 Chatbox 中对话、生成内容、调用模型的行为，都会根据实际使用的 tokens 从 Credits 中扣除。我们按 tokens 计量使用量：",
       creditsBullets: ["输入 tokens：你发送给模型的内容（包括最近对话上下文）", "输出 tokens：模型返回给你的内容", "每一次对话的总消耗 = 输入 tokens + 输出 tokens"],
@@ -256,6 +384,9 @@ export default function DocPage() {
                 <a href="#qa" className="block rounded-md px-2 py-1 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-900 dark:hover:text-zinc-50">
                   {t.nav.qa}
                 </a>
+                <a href="#mintlify" className="block rounded-md px-2 py-1 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-900 dark:hover:text-zinc-50">
+                  {t.nav.mintlify}
+                </a>
                 <a href="#credits" className="block rounded-md px-2 py-1 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-900 dark:hover:text-zinc-50">
                   {t.nav.credits}
                 </a>
@@ -296,6 +427,40 @@ export default function DocPage() {
             <section id="overview" className="space-y-4">
               <h1 className="font-serif text-3xl font-bold tracking-tight sm:text-4xl">{t.overviewTitle}</h1>
               <p className="max-w-2xl text-sm text-zinc-600 dark:text-zinc-400">{t.overviewIntro}</p>
+            </section>
+
+            <section id="mintlify" className="space-y-4">
+              <h2 className="text-xl font-semibold tracking-tight">{t.mintlifyTitle}</h2>
+              <p className="max-w-2xl text-sm text-zinc-600 dark:text-zinc-400">{t.mintlifyIntro}</p>
+              <ol className="ml-5 list-decimal space-y-1 text-sm text-zinc-700 dark:text-zinc-300">
+                {t.mintlifySteps.map((step, i) => (
+                  <li key={`mint-step-${i}`}>{step}</li>
+                ))}
+              </ol>
+              <div className="space-y-2 text-sm">
+                <div className="text-xs font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">{t.mintlifyLinksLabel}</div>
+                <div className="flex flex-wrap gap-3">
+                  {t.mintlifyLinks.map((link) => (
+                    <a
+                      key={link.href}
+                      href={link.href}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="rounded-full border border-zinc-200 px-3 py-1 text-xs text-zinc-700 hover:border-zinc-400 hover:text-zinc-900 dark:border-zinc-700 dark:text-zinc-300 dark:hover:border-zinc-500 dark:hover:text-zinc-50"
+                    >
+                      {link.label}
+                    </a>
+                  ))}
+                </div>
+              </div>
+              <div className="overflow-hidden rounded-2xl border border-zinc-200 bg-zinc-50 text-xs text-zinc-700 shadow-sm dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-200">
+                <div className="border-b border-zinc-200 px-4 py-2 text-[11px] font-semibold uppercase tracking-wide text-zinc-500 dark:border-zinc-800 dark:text-zinc-400">
+                  vercel.json
+                </div>
+                <pre className="overflow-x-auto px-4 py-3 leading-relaxed">
+                  <code>{t.mintlifyCode}</code>
+                </pre>
+              </div>
             </section>
 
             <section id="quick-start" className="space-y-3">
