@@ -1,0 +1,16 @@
+{
+  "name": "PersonaAI Docs",
+  "logo": "https://theoutlier.mintlify.app/mintlify-assets/logo-light.png",
+  "favicon": "https://theoutlier.mintlify.app/mintlify-assets/favicon.png",
+  "navigation": [
+    {
+      "group": "Getting Started",
+      "pages": ["index", "billing-credits"]
+    }
+  ],
+  "colors": {
+    "primary": "#0f172a",
+    "light": "#f8fafc",
+    "dark": "#0b0f19"
+  }
+}

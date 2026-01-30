@@ -1,0 +1,98 @@
+---
+title: "文档概览"
+description: "Persona AI 文档与 Mintlify 托管说明"
+---
+
+# 文档概览
+
+Persona AI 使用「按模型使用量计费 + Credits 额度」的方式，对你在 Chatbox 中调用大模型的开销进行结算。本页面帮助你快速理解：如何购买 Credits、不同会员每月包含多少 Credits，以及每个模型大概消耗多少 Credits。
+
+> Persona AI uses a usage-based billing + Credits quota model. This page explains how Credits work and how pricing is calculated.
+
+## Mintlify 托管
+
+我们的文档托管在 Mintlify，通过 Vercel 子路径反向代理到主站域名。请按 Mintlify 的部署指引开启子路径托管，并在 `vercel.json` 中加入下列 rewrites。
+
+> We host docs on Mintlify and proxy them to a subpath under the main domain. Follow the Mintlify guide and apply the rewrites below.
+
+### 操作步骤
+
+1. 进入 Mintlify Dashboard → Custom domain setup，开启 Host at subpath。
+2. 确认项目域名可用，并记录 dashboard URL 末尾的 subdomain。
+3. 在 `vercel.json` 中添加下面的 rewrites，替换 subdomain 与 subpath。
+
+### 参考文档
+
+- [Vercel 子路径部署指南](https://www.mintlify.com/docs/deploy/vercel.md)
+- [文档索引（llms.txt）](https://www.mintlify.com/docs/llms.txt)
+
+```json
+{
+  "rewrites": [
+    {
+      "source": "/_mintlify/:path*",
+      "destination": "https://theoutlier.mintlify.app/_mintlify/:path*"
+    },
+    {
+      "source": "/api/request",
+      "destination": "https://theoutlier.mintlify.app/_mintlify/api/request"
+    },
+    {
+      "source": "/doc",
+      "destination": "https://theoutlier.mintlify.app/doc"
+    },
+    {
+      "source": "/doc/llms.txt",
+      "destination": "https://theoutlier.mintlify.app/llms.txt"
+    },
+    {
+      "source": "/doc/llms-full.txt",
+      "destination": "https://theoutlier.mintlify.app/llms-full.txt"
+    },
+    {
+      "source": "/doc/sitemap.xml",
+      "destination": "https://theoutlier.mintlify.app/sitemap.xml"
+    },
+    {
+      "source": "/doc/robots.txt",
+      "destination": "https://theoutlier.mintlify.app/robots.txt"
+    },
+    {
+      "source": "/doc/mcp",
+      "destination": "https://theoutlier.mintlify.app/mcp"
+    },
+    {
+      "source": "/doc/:path*",
+      "destination": "https://theoutlier.mintlify.app/doc/:path*"
+    },
+    {
+      "source": "/mintlify-assets/:path+",
+      "destination": "https://theoutlier.mintlify.app/mintlify-assets/:path+"
+    }
+  ]
+}
+```
+
+## 快速开始
+
+- 在 Settings → Models 启用至少一个模型。
+- 复杂任务优先选择 PersonaAI；日常任务选择性价比更高的模型。
+- 开始对话后在 Usage History 查看 Credits。
+
+> Enable at least one model in Settings → Models, then start a chat and monitor Credits in Usage History.
+
+## 最佳实践
+
+- 保持提示词精炼，过长上下文会增加输入 tokens。
+- 输出尽量简短聚焦。
+- 复杂任务用 PersonaAI，轻量问答用组合模型。
+
+> Keep prompts concise, prefer shorter outputs, and select models based on task complexity.
+
+## Q&A / 常见问题
+
+- 扣费高于预期？请检查总 tokens（输入 + 输出）。
+- 模型不可用？请确认服务端已配置 API Key，或切换模型。
+- 响应较慢？尝试缩短输出或更换模型。
+
+> Higher cost than expected? Check total tokens. Model unavailable? Configure API keys or switch models.

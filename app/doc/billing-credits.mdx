@@ -1,0 +1,68 @@
+---
+title: "计费与 Credits"
+description: "Credits 定义、会员方案与模型扣费标准"
+---
+
+# 计费与 Credits
+
+## 1. Credits 是什么？
+
+Credits 可以理解为「大模型调用额度」。所有在 Chatbox 中对话、生成内容、调用模型的行为，都会根据实际使用的 tokens 从 Credits 中扣除。
+
+- 输入 tokens：你发送给模型的内容（包括最近对话上下文）
+- 输出 tokens：模型返回给你的内容
+- 每一次对话的总消耗 = 输入 tokens + 输出 tokens
+
+> Credits represent your LLM usage quota. Total cost per round = input tokens + output tokens.
+
+## 2. 会员与每月可用 Credits
+
+你可以在定价页或 Billing 页面中购买或切换会员。不同会员方案每月包含的 Credits 如下：
+
+| 方案 | 价格 | 每月 Credits | 说明 |
+| --- | --- | --- | --- |
+| 普通会员 · 按月 | $40 / 月 | 500 | 超出部分按实际使用量扣除 |
+| 高级会员 · 按月 | $100 / 月 | 1000 | 超出部分按实际使用量扣除 |
+| 普通会员 · 年付 | $400 / 年 | 500 | 年付一次性支付，每月自动发放 Credits |
+| 高级会员 · 年付 | $1000 / 年 | 1000 | 年付一次性支付，每月自动发放 Credits |
+
+> Overages are deducted based on actual usage. Yearly plans are billed annually, Credits issued monthly.
+
+## 3. 不同模型的 Credits 扣费标准
+
+我们会根据你选择的模型，对「本轮对话产生的总 tokens 数」按不同单价折算为 Credits：
+
+- 以每 1,000 tokens 为计费单位（不足 1,000 按比例计算）。
+- 总 tokens = 输入 tokens + 输出 tokens。
+- 不同模型有不同的每 1,000 tokens 消耗标准。
+
+| 模型 | Credits / 1,000 tokens | 说明 |
+| --- | --- | --- |
+| PersonaAI（Gemini 3.0 Pro） | 0.9 | 高级推理与创作模型，适合内容生产、深度分析等场景。 |
+| Nanobanana / GPT5.2 / Gemini3.0 Pro / Minimax M2 / Kimi0905 | 0.45 | 高性价比通用模型组合，适合日常问答、创意辅助、运营建议。 |
+
+> Rates may be adjusted based on upstream costs; updates will be reflected here.
+
+## 4. 实际扣费示例
+
+假设你选择 PersonaAI（基于 Gemini 3.0 Pro），并进行一次典型对话：
+
+- 你发送的问题和上下文合计约 500 tokens
+- 模型回复内容约 800 tokens
+- 本轮总 tokens ≈ 1,300 tokens
+
+PersonaAI 按每 1,000 tokens 消耗 0.9 Credits 计算，则本轮大约扣除：
+
+**1,300 ÷ 1,000 × 0.9 ≈ 1.17 Credits**
+
+> 500 Credits 约可以支持几百到上千轮高质量对话（取决于输出长度）。
+
+## 5. 查看用量与历史
+
+你可以在应用内随时查看 Credits 余额和详细的使用记录：
+
+- 登录后，进入右上角头像菜单中的 Settings。
+- 切换到「Usage History」标签页，查看扣费记录与 Credits 变化。
+- 团队版或企业版需求（自定义配额、独立模型配置）可联系我们。
+
+> You can check remaining Credits and history from Settings → Usage History after login.
